@@ -22,10 +22,12 @@ fi
 if [[ "${ZCODE_USAGE_SQLITE:-}" == "node" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
   q() { node "$SCRIPT_DIR/sqlite.mjs" -header "$DB" "$1"; }
   qr() { node "$SCRIPT_DIR/sqlite.mjs" "$DB" "$1"; }
+  qc() { node "$SCRIPT_DIR/sqlite.mjs" -csv -header "$DB" "$1"; }
 else
   q() { sqlite3 -readonly -header -column "$DB" "$1"; }
   # 输出原始单值（供 JSON 组装），不带表格格式化
   qr() { sqlite3 -readonly "$DB" "$1"; }
+  qc() { sqlite3 -readonly -csv -header "$DB" "$1"; }
 fi
 
 is_num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
@@ -47,6 +49,8 @@ PV_LABEL="CASE WHEN provider_id LIKE 'account:%' THEN '官方·'||substr(provide
 sql_quote() {
   local value="$1"
   # Bash 3.2 的替换表达式置于双引号内会保留多余反斜杠。
+  # 仅限短字符串（会话 ID / 路径 / 价格表路径）；大文本禁止走此函数——
+  # bash 3.2 的 ${var//} 在长串 + replacement 含反斜杠时是平方级（见 dashboard.sh META）。
   value=${value//\'/\'\'}
   printf "'%s'" "$value"
 }

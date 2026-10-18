@@ -1281,41 +1281,27 @@
     {
       "name": "usage-detail",
       "source": "./external_plugins/usage-detail",
+      "version": "0.23.4",
+      "description": "Local per-request usage analytics for ZCode: drill-down request rows (token breakdown, tok/s, cache rate), a live session side-panel dashboard, session health scores, model leaderboard, waste forensics, budget and burn alerts, list-price converted costs, activity heatmap and export - read-only local SQLite, zero model overhead.",
       "displayName": "Usage Detail",
       "displayName_i18n": {
-        "en": "Usage Detail",
         "zh-CN": "用量明细"
       },
-      "description": "Local per-request usage analytics for ZCode: drill-down request rows (token breakdown, tok/s, cache rate), a live session side-panel dashboard, session health scores, model leaderboard, waste forensics, budget and burn alerts, list-price converted costs, activity heatmap and export - read-only local SQLite, zero model overhead.",
       "description_i18n": {
         "en": "Local per-request usage analytics for ZCode: drill-down request rows (token breakdown, tok/s, cache rate), a live session side-panel dashboard, session health scores, model leaderboard, waste forensics, budget and burn alerts, list-price converted costs, activity heatmap and export - read-only local SQLite, zero model overhead.",
         "zh-CN": "ZCode 本地逐条用量分析：请求明细钻取（token 构成、tok/s、缓存率）、会话侧栏实时仪表盘、会话健康分、模型效率排行、浪费取证、预算与燃烧告警、折算成本（官方牌价）、活跃热力图与导出——只读本地 SQLite，零模型开销。"
       },
-      "version": "0.16.0",
-      "author": {
-        "name": "axdlee",
-        "url": "https://github.com/axdlee"
-      },
-      "category": "utilities",
+      "category": "developer-tools",
+      "icon": "assets/usage-detail/icon.png",
+      "license": "MIT",
       "keywords": [
         "usage",
         "tokens",
         "cost",
-        "analytics",
         "dashboard",
-        "mcp"
-      ],
-      "examplePrompts": [
-        "Show my token usage and cost for today",
-        "Which model has the best output speed and cache hit rate?"
-      ],
-      "examplePrompts_i18n": {
-        "zh-CN": [
-          "看看我今天用了多少 token、折算多少钱",
-          "哪个模型输出速度最快、缓存命中率最高？"
-        ]
-      },
-      "icon": "https://cdn-zcode.z.ai/zcode/official-plugin/assets/usage-detail/icon.png"
+        "quota",
+        "analytics"
+      ]
     }
   ]
 }

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const HERE_NOTIFY = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
 
 try {
-  const v = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.zcode', 'usage-alerts.json'), 'utf8'));
+  const v = JSON.parse(String(fs.readFileSync(path.join(os.homedir(), '.zcode', 'usage-alerts.json'), 'utf8')).replace(/^\uFEFF/, ''));
   if (v.permission !== true) process.exit(0);
   let tool = '';
   try {
@@ -21,7 +21,7 @@ try {
   } catch (e) {}
   const msg = tool ? `正在等待你批准：${tool}` : 'Agent 正在等待你的批准';
   // 统一经 notify.mjs 分发：macOS / Windows / Linux，失败静默
-  spawn(process.execPath, [path.join(HERE_NOTIFY, 'notify.mjs'), 'ZCode 用量', '需要你的确认', msg],
+  spawn(process.execPath, [path.join(HERE_NOTIFY, "notify.mjs"), "ZCode 用量", "需要你的确认", msg, "zcode"],
     { detached: true, stdio: 'ignore' }).unref();
 } catch (e) {}
 process.exit(0);

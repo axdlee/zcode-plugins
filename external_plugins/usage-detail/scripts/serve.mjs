@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { queryAllVendors } from './vendor-quota.mjs';
+import { providerNames, projectMap } from './lib/project-meta.mjs';
 
 const port = Number(process.argv[2]) || 7741;
 const DB = process.env.ZCODE_USAGE_DB || path.join(os.homedir(), '.zcode/cli/db/db.sqlite');
@@ -36,6 +38,8 @@ function q(sql) {
   if (!row) return '';
   return String(row[Object.keys(row)[0]]);
 }
+// turn_id 是较新 ZCode 才有的列：老库直接 SELECT 会 prepare 失败，先探测再拼表达式
+const TURN_EXPR = q("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='turn_id'") === '1' ? 'R.turn_id' : 'NULL';
 
 function pricePath() {
   if (process.env.ZCODE_USAGE_PRICES && fs.existsSync(process.env.ZCODE_USAGE_PRICES)) return process.env.ZCODE_USAGE_PRICES;
@@ -44,7 +48,7 @@ function pricePath() {
   return fs.existsSync(d) ? d : null;
 }
 
-const META_SQL = (pfText, limit, disk) => `
+const META_SQL = (pfText, limit, disk, extraJson) => `
   WITH P AS (SELECT provider_id AS v, row_number() OVER (ORDER BY provider_id)-1 AS i FROM (SELECT DISTINCT provider_id FROM model_usage)),
        M AS (SELECT model_id AS v, row_number() OVER (ORDER BY model_id)-1 AS i FROM (SELECT DISTINCT model_id FROM model_usage)),
        S AS (SELECT session_id AS v, row_number() OVER (ORDER BY session_id)-1 AS i FROM (SELECT DISTINCT session_id FROM model_usage)),
@@ -62,6 +66,10 @@ const META_SQL = (pfText, limit, disk) => `
     'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
     'sessionTools',(SELECT COALESCE(json_group_array(json_array(SI.i, t.tool, t.c, t.ms)),'[]') FROM (SELECT session_id AS sid, tool_name AS tool, count(*) AS c, CAST(sum(duration_ms) AS int) AS ms FROM tool_usage GROUP BY session_id, tool_name) t LEFT JOIN S SI ON SI.v = t.sid WHERE SI.i IS NOT NULL),
     'disk', json('${JSON.stringify(disk).replace(/'/g, "''")}'),
+    'providerNames', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."providerNames"'),
+    'projectMap', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."projectMap"'),
+    'budgetDaily', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetDaily"'),
+    'budgetMonthly', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetMonthly"'),
     'prices',(SELECT CASE
               WHEN pj IS NULL OR NOT json_valid(pj) THEN json('{}')
               ELSE json_object('currency', COALESCE(json_extract(pj,'$.currency'),'CNY'),
@@ -81,7 +89,7 @@ const META_SQL = (pfText, limit, disk) => `
               R.duration_ms,
               CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
               CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count))
+              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${TURN_EXPR}))
             FROM R
             LEFT JOIN S SI ON SI.v = R.session_id
             LEFT JOIN M MI ON MI.v = R.model_id
@@ -89,12 +97,30 @@ const META_SQL = (pfText, limit, disk) => `
 
 // ---------- 价格表与预算的用户设置（serve 模式的面板内管理） ----------
 let pricesCache = { at: 0, v: null };
+// Windows 记事本等编辑器保存的 UTF-8 文件常带 BOM，JSON.parse 会直接抛错——读取后剥除
+const stripBom = (s) => String(s == null ? '' : s).replace(/^\uFEFF/, '');
+// 原子写 + Windows 兜底：rename 到被占用（杀毒/并发读）的目标会 EPERM——短重试后直写保功能
+function atomicWrite(file, data, mode) {
+  const tmp = file + '.tmp';
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (mode != null) fs.writeFileSync(tmp, data, { mode }); else fs.writeFileSync(tmp, data);
+  for (let i = 0; i < 3; i++) {
+    try { fs.renameSync(tmp, file); return; } catch (e) {
+      if (i === 2) {
+        try { if (mode != null) fs.writeFileSync(file, data, { mode }); else fs.writeFileSync(file, data); } catch (e2) {}
+        try { fs.unlinkSync(tmp); } catch (e2) {}
+        return;
+      }
+      const until = Date.now() + 60; while (Date.now() < until) { /* 短退避 */ }
+    }
+  }
+}
 function readPrices() {
   const pp = pricePath();
   if (!pp || !fs.existsSync(pp)) return { currency: 'CNY', usdCny: null, autoSync: true, models: {} };
   if (pricesCache.v && Date.now() - pricesCache.at < 5000) return pricesCache.v;
   let v;
-  try { v = JSON.parse(fs.readFileSync(pp, 'utf8')); } catch (e) { v = { currency: 'CNY', models: {} }; }
+  try { v = JSON.parse(stripBom(fs.readFileSync(pp, 'utf8'))); } catch (e) { v = { currency: 'CNY', models: {} }; }
   if (!v.models || typeof v.models !== 'object') v = { currency: v.currency || 'CNY', models: v };
   v.usdCny = v.usdCny != null ? v.usdCny : null;
   v.autoSync = v.autoSync !== false;
@@ -112,25 +138,46 @@ function writePrices(next) {
     autoSync: next.autoSync != null ? next.autoSync !== false : (prev.autoSync !== false),
     models: next.models || prev.models || {},
   };
-  const tmp = pp + '.tmp';
-  fs.mkdirSync(path.dirname(pp), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n');
-  fs.renameSync(tmp, pp);
+  atomicWrite(pp, JSON.stringify(merged, null, 2) + '\n');
   pricesCache = { at: 0, v: null };
   frag.html = null; // 改价后立即重算
 }
 function priceEntry(m) {
   const i = Number(m.in), o = Number(m.out), c = Number(m.cache);
-  return { in: Number.isFinite(i) ? Math.max(0, i) : 0, out: Number.isFinite(o) ? Math.max(0, o) : 0, cache: Number.isFinite(c) ? Math.max(0, c) : 0 };
+  const e = { in: Number.isFinite(i) ? Math.max(0, i) : 0, out: Number.isFinite(o) ? Math.max(0, o) : 0, cache: Number.isFinite(c) ? Math.max(0, c) : 0 };
+  if (m.ctx != null) e.ctx = Number(m.ctx) || undefined; // 上下文窗口（models.dev / 内置表），改价时保留
+  const co = Number(m.ctxOverride); // 用户显式覆盖的上下文窗口（0/空 = 清除覆盖，还原自动检测）
+  if (Number.isFinite(co) && co > 0) e.ctxOverride = Math.round(co);
+  return e;
+}
+
+// 多厂商配额凭据（可选）：与 panel-server 同一文件同一格式，权限 0600；只回传「是否已配置」，不回明文
+const VENDOR_IDS = ['deepseek', 'kimi', 'openrouter', 'minimax'];
+function vendorKeysPath() { return path.join(os.homedir(), '.zcode', 'usage-vendors.json'); }
+function readVendorFile() {
+  try { return JSON.parse(stripBom(fs.readFileSync(vendorKeysPath(), 'utf8'))) || {}; } catch (e) { return {}; }
+}
+function readVendorMask() {
+  const v = readVendorFile();
+  return Object.fromEntries(VENDOR_IDS.map((id) => [id, { configured: !!(v[id] && (v[id].key || v[id].token)) }]));
+}
+function writeVendorKeys(keys) {
+  const cur = readVendorFile();
+  for (const id of VENDOR_IDS) {
+    if (!(id in (keys || {}))) continue;
+    const k = String(keys[id] || '').trim();
+    if (k) cur[id] = { key: k };
+    else delete cur[id]; // 空串 = 清除该厂商凭据
+  }
+  atomicWrite(vendorKeysPath(), JSON.stringify(cur, null, 2) + '\n', 0o600);
+  return readVendorMask();
 }
 function budgetPath() { return path.join(os.homedir(), '.zcode', 'usage-budget.json'); }
 function readBudget() {
-  try { return JSON.parse(fs.readFileSync(budgetPath(), 'utf8')); } catch (e) { return { daily: 0, monthly: 0 }; }
+  try { return JSON.parse(stripBom(fs.readFileSync(budgetPath(), 'utf8'))); } catch (e) { return { daily: 0, monthly: 0 }; }
 }
 function writeBudget(b) {
-  const tmp = budgetPath() + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify({ daily: Number(b.daily) || 0, monthly: Number(b.monthly) || 0 }) + '\n');
-  fs.renameSync(tmp, budgetPath());
+  atomicWrite(budgetPath(), JSON.stringify({ daily: Number(b.daily) || 0, monthly: Number(b.monthly) || 0 }) + '\n');
 }
 function readBody(req) {
   return new Promise(function (resolve, reject) {
@@ -145,9 +192,9 @@ const TURNSTATS_FILE = path.join(os.homedir(), '.zcode', 'usage-turnstats.json')
 const ALERTS_CFG = path.join(os.homedir(), '.zcode', 'usage-alerts.json');
 function readSwitches() {
   let ts = { enabled: false, mode: 'inject' };
-  try { ts = Object.assign(ts, JSON.parse(fs.readFileSync(TURNSTATS_FILE, 'utf8'))); } catch (e) {}
+  try { ts = Object.assign(ts, JSON.parse(stripBom(fs.readFileSync(TURNSTATS_FILE, 'utf8')))); } catch (e) {}
   let al = {};
-  try { al = JSON.parse(fs.readFileSync(ALERTS_CFG, 'utf8')); } catch (e) {}
+  try { al = JSON.parse(stripBom(fs.readFileSync(ALERTS_CFG, 'utf8'))); } catch (e) {}
   return {
     turnstats: ts.enabled === true ? (ts.mode === 'notify' ? 'notify' : 'inject') : 'off',
     budgetAlerts: al.budget !== false,
@@ -157,18 +204,14 @@ function readSwitches() {
 function writeSwitches(b) {
   if (b.turnstats === 'off' || b.turnstats === 'notify' || b.turnstats === 'inject') {
     const v = b.turnstats === 'off' ? { enabled: false } : { enabled: true, mode: b.turnstats };
-    const tmp = TURNSTATS_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(v) + '\n');
-    fs.renameSync(tmp, TURNSTATS_FILE);
+    atomicWrite(TURNSTATS_FILE, JSON.stringify(v) + '\n');
   }
   const al = readSwitches();
   if (typeof b.budgetAlerts === 'boolean' || typeof b.permissionAlerts === 'boolean') {
     const next = {};
     if (typeof b.budgetAlerts === 'boolean') next.budget = b.budgetAlerts;
     if (typeof b.permissionAlerts === 'boolean') next.permission = b.permissionAlerts;
-    const tmp = ALERTS_CFG + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(next) + '\n');
-    fs.renameSync(tmp, ALERTS_CFG);
+    atomicWrite(ALERTS_CFG, JSON.stringify(next) + '\n');
   }
   return readSwitches();
 }
@@ -182,10 +225,18 @@ function clampLimit(v) {
 
 function dataJSON(limit) {
   limit = clampLimit(limit);
+  // 全新环境表还不存在（ZCode 尚未写入）：直接空数据，避免 META SQL 报 no such table。
+  // 注意消费方按字符串处理（res.end(dataJSON())），必须 stringify
+  if (q("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')") !== '2') {
+    return JSON.stringify({ providers: [], models: [], sessions: [], sessionDirs: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk: diskJSON(), providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, prices: {}, total: 0, covered: 0, rows: [] });
+  }
   // node:sqlite 没有 CLI 的 readfile()：价格文件内容在 node 侧读好后内联（单引号转义）
   const pp = pricePath();
-  const pfText = pp ? fs.readFileSync(pp, 'utf8') : null;
-  return q(META_SQL(pfText, limit, diskJSON()));
+  const pfText = pp ? stripBom(fs.readFileSync(pp, 'utf8')) : null;
+  const dirs = q(`SELECT COALESCE(json_group_array(d),'[]') FROM (SELECT DISTINCT se.directory AS d FROM model_usage u LEFT JOIN session se ON se.id=u.session_id WHERE coalesce(se.directory,'')<>'')`).trim() || '[]';
+  let dirsList = [];
+  try { dirsList = JSON.parse(dirs); } catch (e) {}
+  return q(META_SQL(pfText, limit, diskJSON(), JSON.stringify({ providerNames: providerNames(), projectMap: projectMap(dirsList) })));
 }
 
 function liveJSON() {
@@ -227,17 +278,16 @@ function diskJSON() {
 }
 
 let quotaCache = { at: 0, v: null };
-function quotaJSON() {
+async function quotaJSON() {
   if (quotaCache.v && Date.now() - quotaCache.at < 60000) return quotaCache.v;
+  let v;
   try {
-    const out = execFileSync(process.execPath, [path.join(HERE, 'quota.mjs')], { encoding: 'utf8', timeout: 25000 });
-    quotaCache = { at: Date.now(), v: JSON.parse(out) };
+    v = await queryAllVendors(); // 多厂商聚合（GLM 走零密钥日志源，其余可选 Key）
   } catch (e) {
-    let msg = e.message;
-    try { msg = JSON.parse(e.stdout || '{}').error || msg; } catch (e2) {}
-    quotaCache = { at: Date.now(), v: { ok: false, error: String(msg).slice(0, 160) } };
+    v = { ok: false, vendors: [], error: String((e && e.message) || e).slice(0, 160) };
   }
-  return quotaCache.v;
+  quotaCache = { at: Date.now(), v };
+  return v;
 }
 
 function requestJSON(id) {
@@ -254,17 +304,46 @@ function requestJSON(id) {
   return row ? JSON.parse(row) : { error: '未找到该请求' };
 }
 
-function renderFragment(limit) {
-  const out = path.join(os.tmpdir(), 'zcode-usage-serve-' + process.pid + '.html');
+// bash 可执行解析：Windows 的 Git for Windows 默认只把 git.exe 加入 PATH，bash.exe 常缺——
+// 面板/仪表盘生成全部依赖 bash，按常见安装位置兜底查找；找到后进程内缓存
+let bashCmdCache;
+function resolveBash() {
+  if (bashCmdCache) return bashCmdCache;
+  let cmd = 'bash';
+  if (process.platform === 'win32') {
+    const candidates = [
+      process.env.ZCODE_BASH,
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+      'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+      path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'),
+    ].filter(Boolean);
+    cmd = candidates.find((c) => { try { return fs.existsSync(c); } catch (e) { return false; } }) || 'bash';
+  }
+  bashCmdCache = cmd;
+  return cmd;
+}
+
+function renderFragment(limit, forServe) {
+  // 唯一临时名：并发重建时两个 bash 写同一路径会互相读到半成品（panel-server 同类路径已加随机）
+  const out = path.join(os.tmpdir(), 'zcode-usage-serve-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.html');
   const args = [USAGE_SH, 'dashboard', out];
   if (limit > 0) args.push(String(limit)); // -1（全部）走脚本默认，避免 num_arg 校验负数
-  execFileSync('bash', args, { encoding: 'utf8', timeout: 120000 });
+  try {
+    execFileSync(resolveBash(), args, { encoding: 'utf8', timeout: 120000 });
+  } catch (e) {
+    if (e && e.code === 'ENOENT') throw new Error('未找到 bash（Windows 需安装 Git for Windows，或设置 ZCODE_BASH 指向 bash.exe）');
+    throw e;
+  }
   let html = fs.readFileSync(out, 'utf8');
   try { fs.unlinkSync(out); } catch (e) {}
-  // 切换为服务模式：数据走 /api/data，由 boot 函数异步加载
-  html = html.replace(/^const DATA =\n.*$/m, "const DATA = null;\nwindow.__USAGE_DATA_URL__ = '/api/data';\nwindow.__USAGE_SERVE__ = true;");
-  if (html.indexOf('__USAGE_DATA_URL__') < 0) throw new Error('dashboard 生成结果异常');
-  // 服务态附加：刷新按钮 + 实时燃烧率角标（5s 轻轮询）
+  // 服务模式：数据走 /api/data，由 boot 函数异步加载。
+  // 导出报告（forServe=false）必须保留内嵌 DATA——自包含快照脱离本机后无 API 可拉，
+  // 否则 boot 的 fetch 失败、整页只剩静态骨架（曾因无条件替换导致报告导出空数据）。
+  if (forServe !== false) {
+    html = html.replace(/^const DATA =\n.*$/m, "const DATA = null;\nwindow.__USAGE_DATA_URL__ = '/api/data';\nwindow.__USAGE_SERVE__ = true;");
+    if (html.indexOf('__USAGE_DATA_URL__') < 0) throw new Error('dashboard 生成结果异常');
+  // 服务态附加：刷新按钮 + 自动刷新开关（挂机监控；页签 hash 在 reload 后保留）+ 实时燃烧率角标（5s 轻轮询）
   html += `<script>
 (function () {
   var t = setInterval(function () {
@@ -273,15 +352,34 @@ function renderFragment(limit) {
     clearInterval(t);
     var b = document.createElement('button');
     b.type = 'button'; b.className = 'btn'; b.style.margin = '0'; b.style.fontSize = '12px';
-    b.textContent = '刷新数据';
-    b.addEventListener('click', function () { b.disabled = true; b.textContent = '刷新中…'; location.reload(); });
+    b.textContent = tr('刷新数据');
+    b.addEventListener('click', function () { b.disabled = true; b.textContent = tr('刷新中…'); location.reload(); });
     c.appendChild(b);
+    // 自动刷新：60s 整页刷新（保留页签 hash；开关状态记忆在 localStorage）
+    var auto = document.createElement('button');
+    auto.type = 'button'; auto.className = 'ud-toggle'; auto.style.margin = '0'; auto.style.fontSize = '12px';
+    var on = false;
+    try { on = localStorage.getItem('ud-autorefresh') === '1'; } catch (e) {}
+    function paint() { auto.textContent = 'Auto ' + (on ? 'ON' : 'OFF'); auto.setAttribute('aria-pressed', String(on)); }
+    function applyAuto() {
+      paint();
+      if (on) {
+        if (!window.__udAutoT) window.__udAutoT = setInterval(function () { location.reload(); }, 60000);
+      } else if (window.__udAutoT) { clearInterval(window.__udAutoT); window.__udAutoT = null; }
+    }
+    auto.addEventListener('click', function () {
+      on = !on;
+      try { localStorage.setItem('ud-autorefresh', on ? '1' : '0'); } catch (e) {}
+      applyAuto();
+    });
+    paint(); applyAuto();
+    c.appendChild(auto);
     var badge = document.createElement('span');
     badge.id = 'ud-live-badge'; badge.className = 'text-small text-muted';
     c.appendChild(badge);
     function tick() {
       fetch('/api/live').then(function (r) { return r.json(); }).then(function (j) {
-        badge.textContent = '● 实时 · 燃烧率 ' + Number(j.window.rateH || 0).toLocaleString('zh-CN') + ' token/h · 近 5h ' + Number(j.window.tok || 0).toLocaleString('zh-CN') + ' token · 今日 ' + Number(j.today.req || 0).toLocaleString('zh-CN') + ' 次';
+        badge.textContent = '● ' + tr('实时') + ' · ' + tr('燃烧率') + ' ' + Number(j.window.rateH || 0).toLocaleString('zh-CN') + ' token/h · ' + tr('近 5h') + ' ' + Number(j.window.tok || 0).toLocaleString('zh-CN') + ' tok · ' + tr('今日') + ' ' + Number(j.today.req || 0).toLocaleString('zh-CN') + ' ' + tr('次') + '';
       }).catch(function () {});
     }
     tick();
@@ -289,6 +387,7 @@ function renderFragment(limit) {
   }, 200);
 })();
 </script>`;
+  }
   return html;
 }
 
@@ -306,13 +405,15 @@ function getFragment(limit) {
   return frag.html;
 }
 
-// 启动时价格表每日自动同步一次（与 dashboard 口径一致，可 env 关闭）
+// 启动时价格表每日自动同步一次（与 dashboard 口径一致，可 env 关闭；尊重价格表 autoSync:false 的用户 opt-out）
 try {
   if (process.env.ZCODE_USAGE_NO_AUTOSYNC !== '1') {
     let stale = !fs.existsSync(USER_PRICE);
     if (!stale) stale = Date.now() - fs.statSync(USER_PRICE).mtimeMs >= 86400e3;
-    if (stale && fs.existsSync(process.env.ZCODE_USAGE_PRICES || '/dev/null') === false || stale) {
-      spawn('bash', [USAGE_SH, 'prices', 'sync'], { detached: true, stdio: 'ignore' }).unref();
+    let autoOff = false;
+    try { autoOff = /"autoSync"[: ]*false/.test(stripBom(fs.readFileSync(USER_PRICE, 'utf8'))); } catch (e) {}
+    if (stale && !autoOff) {
+      spawn(resolveBash(), [USAGE_SH, 'prices', 'sync'], { detached: true, stdio: 'ignore' }).unref();
     }
   }
 } catch (e) {}
@@ -360,7 +461,10 @@ function budgetWatchTick() {
     if (r[1] >= t0.getTime()) {
       tok += t;
       const pj = PR[String(D.models[r[2]] || '').toLowerCase()];
-      if (pj && Number(pj.in) >= 0) cost += (nn(r[4]) * nn(pj.in) + nn(r[5]) * nn(pj.out) + nn(r[6]) * nn(pj.cache)) / 1e6;
+      if (pj && Number(pj.in) >= 0) {
+        const miss = Math.max(0, nn(r[4]) - nn(r[6])); // input 含缓存命中，命中段按 cache 价（与前端 rowCost 同口径）
+        cost += (miss * nn(pj.in) + nn(r[5]) * nn(pj.out) + nn(r[6]) * nn(pj.cache)) / 1e6;
+      }
     } else base += t;
   }
   const daily = nn(budget.daily);
@@ -379,6 +483,22 @@ function budgetWatchTick() {
 const server = http.createServer(async function (req, res) {
   const u = new URL(req.url, 'http://127.0.0.1');
   try {
+    // 防 DNS rebinding 与跨站写（CSRF）：Host 必须为本机；带 Origin 的写请求必须同源。
+    // Origin 缺失（curl/地址栏导航）放行——浏览器发起的跨站 fetch 一定带 Origin。
+    const host = String(req.headers.host || '').toLowerCase();
+    if (host !== '127.0.0.1:' + listenPort && host !== 'localhost:' + listenPort) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Forbidden');
+      return;
+    }
+    if (req.method === 'POST') {
+      const origin = String(req.headers.origin || '');
+      if (origin && origin !== 'http://127.0.0.1:' + listenPort && origin !== 'http://localhost:' + listenPort) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Forbidden');
+        return;
+      }
+    }
     if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/index.html')) {
       const limit = u.searchParams.get('limit');
       const fragHtml = getFragment(limit);
@@ -389,7 +509,7 @@ const server = http.createServer(async function (req, res) {
       res.end(dataJSON(u.searchParams.get('limit')));
     } else if (req.method === 'GET' && u.pathname === '/api/quota') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify(quotaJSON()));
+      res.end(JSON.stringify(await quotaJSON()));
     } else if (req.method === 'GET' && u.pathname === '/api/request') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(requestJSON(u.searchParams.get('id') || '')));
@@ -412,7 +532,13 @@ const server = http.createServer(async function (req, res) {
       const model = String(b.model || '').trim();
       if (!model) throw new Error('模型名不能为空');
       const next = readPrices();
-      next.models[model] = priceEntry(b);
+      const prev = next.models[model] || {};
+      // ctxOverride 显式传空串 = 清除覆盖；未传 = 保留原值
+      next.models[model] = priceEntry({
+        ...b,
+        ctx: prev.ctx ?? b.ctx,
+        ctxOverride: b.ctxOverride !== undefined ? b.ctxOverride : prev.ctxOverride,
+      });
       writePrices(next);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, model: model }));
@@ -425,6 +551,13 @@ const server = http.createServer(async function (req, res) {
       writePrices(next);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true }));
+    } else if (req.method === 'POST' && u.pathname === '/api/vendors/set') {
+      const b = await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, vendors: writeVendorKeys(b) }));
+    } else if (req.method === 'GET' && u.pathname === '/api/vendors') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(readVendorMask()));
     } else if (req.method === 'POST' && u.pathname === '/api/prices/remove') {
       const b = await readBody(req);
       const next = readPrices();
@@ -449,11 +582,11 @@ const server = http.createServer(async function (req, res) {
       res.end(JSON.stringify(writeSwitches(b)));
     } else if (req.method === 'GET' && (u.pathname === '/report.html' || u.pathname === '/report')) {
       // 自包含报表：内嵌全部数据的一次性快照（供存档/分享/打印）
-      const html = renderFragment(-1).replace('window.__USAGE_SERVE__ = true;', 'window.__USAGE_SERVE__ = false;');
+      const html = renderFragment(-1, false); // 自包含快照：保留内嵌 DATA、不注入刷新与轮询
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Disposition': 'attachment; filename="zcode-usage-report.html"' });
       res.end(html);
     } else if (req.method === 'POST' && u.pathname === '/api/sync-prices') {
-      const out = execFileSync('bash', [USAGE_SH, 'prices', 'sync'], { encoding: 'utf8', timeout: 90000 });
+      const out = execFileSync(resolveBash(), [USAGE_SH, 'prices', 'sync'], { encoding: 'utf8', timeout: 90000 });
       frag.html = null;
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, message: out.trim().split('\n').pop() }));
@@ -467,10 +600,29 @@ const server = http.createServer(async function (req, res) {
   }
 });
 
+// 端口策略：默认端口被占（EADDRINUSE）自动顺延 7742-7749，实际端口写入 usage-serve.json
+// （panel-server 的 open_full_panel 以该文件为准返回真实地址）；用户显式指定端口被占则报错退出
+const PORT_BASE = port === 7741; // 未显式指定时 argv[2] 缺省回退 7741
+let listenPort = port;
+server.on('error', function (e) {
+  if (e && e.code === 'EADDRINUSE') {
+    if (PORT_BASE && listenPort < 7749) {
+      listenPort++;
+      server.listen(listenPort, '127.0.0.1');
+      return;
+    }
+    console.error(PORT_BASE
+      ? '7741-7749 端口均被占用，无法启动本地面板'
+      : `端口 ${port} 已被占用（你显式指定了该端口），换一个端口再试：usage.sh serve <端口>`);
+    process.exit(1);
+  }
+  throw e;
+});
+
 server.listen(port, '127.0.0.1', function () {
-  const url = 'http://127.0.0.1:' + port;
-  console.log('ZCode 用量面板已启动：' + url + '  （Ctrl-C 退出，仅监听本机，v' + PLUGIN_VERSION + '）');
-  try { fs.writeFileSync(path.join(os.homedir(), '.zcode', 'usage-serve.json'), JSON.stringify({ pid: process.pid, version: PLUGIN_VERSION, port })); } catch (e) {}
+  const url = 'http://127.0.0.1:' + listenPort;
+  console.log('ZCode 用量面板已启动：' + url + (listenPort !== port ? `（${port} 被占，已顺延）` : '') + '  （Ctrl-C 退出，仅监听本机，v' + PLUGIN_VERSION + '）');
+  try { fs.writeFileSync(path.join(os.homedir(), '.zcode', 'usage-serve.json'), JSON.stringify({ pid: process.pid, version: PLUGIN_VERSION, port: listenPort })); } catch (e) {}
   setInterval(budgetWatchTick, 60000).unref(); // 预算/燃烧告警：每分钟检查，当日每档最多提醒一次
   if (process.platform === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
   else if (process.platform === 'win32') spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsVerbatimArguments: true }).unref();

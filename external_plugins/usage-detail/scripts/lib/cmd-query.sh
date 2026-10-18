@@ -8,7 +8,7 @@ cmd_summary() {
               sum(input_tokens) AS 输入token,
               sum(output_tokens+reasoning_tokens) AS 生成token,
               sum(cache_read_input_tokens) AS 缓存读token
-       FROM model_usage WHERE status='completed';"
+       FROM model_usage;"
     echo
     echo "—— 今日 ——"
     q "SELECT count(*) AS 请求数,
@@ -180,7 +180,14 @@ cmd_export() {
     case "$kind" in
       csv)
         out="${out:-zcode-usage-export.csv}"
-        sqlite3 -readonly -csv "$DB" "
+        # 全新环境表还不存在：导出表头空 CSV，而不是让 SQL 报 no such table（与 json 分支同守卫）
+        if [[ "$(qr "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')")" != "2" ]]; then
+          printf 'time,session,project,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,duration_ms,status\n' > "$out"
+          echo "已导出 CSV（空库）：$out"
+          return
+        fi
+        # qc()：CLI 用 sqlite3 -csv，无 sqlite3 环境（Windows 常见）走 node 替身的 -csv 模式
+        qc "
           SELECT datetime(m.started_at/1000,'unixepoch','localtime') AS time,
                  substr(coalesce(s.title,''),1,80) AS session,
                  s.directory AS project,
@@ -195,6 +202,15 @@ cmd_export() {
         ;;
       json)
         out="${out:-zcode-usage-export.json}"
+        # 全新环境表还不存在：导出空数据而不是让 SQL 崩
+        if [[ "$(qr "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')")" != "2" ]]; then
+          printf '{"providers":[],"models":[],"sessions":[],"sessionDirs":[],"total":0,"covered":0,"rows":[]}\n' > "$out"
+          echo "已导出 JSON（空库）：$out"
+          return
+        fi
+        # turn_id 是较新 ZCode 才有的列：老库直接 SELECT 会 prepare 失败，先探测再拼表达式
+        turn_expr="NULL"
+        [[ "$(qr "SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='turn_id'")" == "1" ]] && turn_expr="R.turn_id"
         qr "
           WITH P AS (SELECT provider_id AS v, row_number() OVER (ORDER BY provider_id)-1 AS i FROM (SELECT DISTINCT provider_id FROM model_usage)),
                M AS (SELECT model_id AS v, row_number() OVER (ORDER BY model_id)-1 AS i FROM (SELECT DISTINCT model_id FROM model_usage)),
@@ -214,7 +230,7 @@ cmd_export() {
                       R.duration_ms,
                       CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
                       CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-                  R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count))
+                  R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turn_expr}))
                     FROM R
                     LEFT JOIN S SI ON SI.v = R.session_id
                     LEFT JOIN M MI ON MI.v = R.model_id

@@ -13,7 +13,6 @@ import { DatabaseSync } from 'node:sqlite';
 const DB = process.env.ZCODE_USAGE_DB || path.join(os.homedir(), '.zcode/cli/db/db.sqlite');
 const USER_PRICE = process.env.ZCODE_USAGE_PRICES || path.join(os.homedir(), '.zcode/usage-prices.json');
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const PANEL_HTML = path.join(HERE, '..', 'ui', 'panel.html');
 const DEFAULT_LIMIT = process.env.ZCODE_USAGE_LIMIT && Number(process.env.ZCODE_USAGE_LIMIT)
   ? Math.max(1, Math.min(20000, Number(process.env.ZCODE_USAGE_LIMIT)))
   : -1; // 默认全部
@@ -30,14 +29,23 @@ function q1(sql) {
   if (!row) return '';
   return String(row[Object.keys(row)[0]]);
 }
+// turn_id 是较新 ZCode 才有的列：老库直接 SELECT 会 prepare 失败，先探测再拼表达式
+let turnExprCache = null;
+function turnExpr() {
+  if (turnExprCache == null) {
+    try { turnExprCache = q1("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='turn_id'") === '1' ? 'R.turn_id' : 'NULL'; }
+    catch (e) { turnExprCache = 'NULL'; }
+  }
+  return turnExprCache;
+}
 
 function priceText() {
   const p = USER_PRICE;
-  try { return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null; } catch (e) { return null; }
+  try { return fs.existsSync(p) ? stripBom(fs.readFileSync(p, 'utf8')) : null; } catch (e) { return null; }
 }
 
 // 全量 META（与 serve.mjs 同一形状：行数组 + 索引映射，前端聚合）
-function metaSQL(limit, disk) {
+function metaSQL(limit, disk, extraJson) {
   const pt = priceText();
   const PJ = pt != null ? `CAST('${pt.replace(/'/g, "''")}' AS text)` : 'NULL';
   return `
@@ -58,6 +66,10 @@ function metaSQL(limit, disk) {
     'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
     'sessionTools',(SELECT COALESCE(json_group_array(json_array(SI.i, t.tool, t.c, t.ms)),'[]') FROM (SELECT session_id AS sid, tool_name AS tool, count(*) AS c, CAST(sum(duration_ms) AS int) AS ms FROM tool_usage GROUP BY session_id, tool_name) t LEFT JOIN S SI ON SI.v = t.sid WHERE SI.i IS NOT NULL),
     'disk', json('${JSON.stringify(disk).replace(/'/g, "''")}'),
+    'providerNames', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."providerNames"'),
+    'projectMap', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."projectMap"'),
+    'budgetDaily', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetDaily"'),
+    'budgetMonthly', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetMonthly"'),
     'prices',(SELECT CASE
           WHEN pj IS NULL OR NOT json_valid(pj) THEN json('{}')
           ELSE json_object('currency', COALESCE(json_extract(pj,'$.currency'),'CNY'),
@@ -77,7 +89,7 @@ function metaSQL(limit, disk) {
               R.duration_ms,
               CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
               CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count))
+              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turnExpr()}))
             FROM R
             LEFT JOIN S SI ON SI.v = R.session_id
             LEFT JOIN M MI ON MI.v = R.model_id
@@ -91,7 +103,15 @@ function dataJSON(limit) {
   else if (Number(limit) > 0) limit = Math.max(1, Math.min(20000, Number(limit)));
   if (metaCache.v && metaCache.v.limit === limit && Date.now() - metaCache.at < 15000) return metaCache.v.data;
   const disk = { logs: duMB(path.join(os.homedir(), '.zcode/v2/logs')), rollout: duMB(path.join(os.homedir(), '.zcode/cli/rollout')), artifacts: duMB(path.join(os.homedir(), '.zcode/cli/artifacts')), db: duMB(DB) };
-  const data = JSON.parse(q1(metaSQL(limit, disk)));
+  // 全新环境表还不存在（ZCode 尚未写入）：直接空数据，避免 META SQL 报 no such table
+  if (q1("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')") !== '2') {
+    return { providers: [], models: [], sessions: [], sessionDirs: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk, providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, prices: {}, total: 0, covered: 0, rows: [] };
+  }
+  let dirsList = [];
+  try { dirsList = JSON.parse(q1(`SELECT COALESCE(json_group_array(d),'[]') FROM (SELECT DISTINCT se.directory AS d FROM model_usage u LEFT JOIN session se ON se.id=u.session_id WHERE coalesce(se.directory,'')<>'')`) || '[]'); } catch (e) {}
+  const bg = readBudgetCfg();
+  const extra = JSON.stringify({ providerNames: vendorDisplayNames(), projectMap: buildProjectMap(dirsList), budgetDaily: Number(bg && bg.daily) || 0, budgetMonthly: Number(bg && bg.monthly) || 0 });
+  const data = JSON.parse(q1(metaSQL(limit, disk, extra)));
   metaCache = { at: Date.now(), v: { limit, data } };
   return data;
 }
@@ -226,6 +246,7 @@ function buildSessionDetail(id) {
 function buildSummary() {
   const D = dataJSON(DEFAULT_LIMIT);
   const R = D.rows || [], MD = D.models || [], PV = D.providers || [], TL = D.sessions || [];
+  const PVN = D.providerNames || {}; // BYOK 真实供应商名（provider_config.json，只取名映射）
   const today0 = new Date(); today0.setHours(0, 0, 0, 0);
   let inn = 0, out = 0, ca = 0, todayReq = 0;
   const pvAgg = {}, mdAgg = {};
@@ -233,7 +254,7 @@ function buildSummary() {
   for (const r of R) {
     inn += r[4]; out += r[5]; ca += r[6];
     if (r[1] >= today0.getTime()) todayReq++;
-    const pv = PV[r[3]] || '?', md = MD[r[2]] || '?';
+    const pv = PVN[PV[r[3]]] || PV[r[3]] || '?', md = MD[r[2]] || '?';
     pvAgg[pv] = (pvAgg[pv] || 0) + r[4] + r[5];
     mdAgg[md] = (mdAgg[md] || 0) + r[4] + r[5];
     const s = sessAgg[r[0]] || (sessAgg[r[0]] = { title: TL[r[0]] || '（无标题）', req: 0, tot: 0, last: 0 });
@@ -292,7 +313,8 @@ function buildSummary() {
     windowEstimate,
     daily, hours, tools, failures, states,
     disk: D.disk || {},
-    serveUrl: 'http://127.0.0.1:7741',
+    // 常驻面板实际地址：端口可能已顺延（usage-serve.json 是 serve 写下的事实源）
+    serveUrl: (() => { const m = servePidFile(); return 'http://127.0.0.1:' + (m && m.port ? m.port : 7741); })(),
   };
 }
 
@@ -315,27 +337,69 @@ function buildDetail(args) {
 }
 
 // ---------- 最小 MCP stdio 协议 ----------
-const SERVER_INFO = { name: 'usage-detail-panel', version: '0.16.0' };
+const SERVER_INFO = { name: 'usage-detail-panel', version: '0.23.4' };
 // 完整版仪表盘作为侧栏页面（与 /usage-ui、serve 本地面板同源同界面，单一维护点）：
 // 调 usage.sh dashboard 生成自包含片段（默认全量历史），包上独立壳（主题变量+页签行为）。
 import { execFile } from 'node:child_process';
 const { SHELL_CSS, TAB_JS } = await import('../shell.mjs');
 const USAGE_SH = path.join(HERE, '..', 'usage.sh');
+import { providerNames as vendorDisplayNames, projectMap as buildProjectMap } from '../lib/project-meta.mjs';
+
+// bash 可执行解析（Windows 的 Git for Windows 默认只把 git.exe 加入 PATH，bash.exe 常缺；
+// 侧栏面板与价格同步都依赖 bash，按常见安装位置兜底查找）——与 serve.mjs 同逻辑
+let bashCmdCache;
+function resolveBash() {
+  if (bashCmdCache) return bashCmdCache;
+  let cmd = 'bash';
+  if (process.platform === 'win32') {
+    const candidates = [
+      process.env.ZCODE_BASH,
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+      'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+      path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'),
+    ].filter(Boolean);
+    cmd = candidates.find((c) => { try { return fs.existsSync(c); } catch (e) { return false; } }) || 'bash';
+  }
+  bashCmdCache = cmd;
+  return cmd;
+}
+
 let dashCache = { at: 0, html: null };
 function getPanelHtml() {
   return new Promise((resolve, reject) => {
     if (dashCache.html && Date.now() - dashCache.at < 60000) return resolve(dashCache.html);
-    const tmp = path.join(os.tmpdir(), 'usage-detail-panel-' + process.pid + '.html');
-    execFile('bash', [USAGE_SH, 'dashboard', tmp], { timeout: 120000, env: { ...process.env, ZCODE_USAGE_LIMIT: process.env.ZCODE_USAGE_LIMIT || '-1' } }, (err) => {
-      if (err) return reject(new Error('生成仪表盘失败：' + (err.message || err)));
-      try {
-        const frag = fs.readFileSync(tmp, 'utf8');
-        fs.unlinkSync(tmp);
-        const html = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZCode 用量面板</title><style>' + SHELL_CSS + '</style></head><body style="padding:10px 12px 40px;max-width:none"><script>window.__USAGE_SERVE__=false;</script>' + frag + '<script>' + TAB_JS + '</scr' + 'ipt></body></html>';
+    const gen = (limitEnv) => new Promise((res2, rej2) => {
+      // 唯一临时名：并发 resources/read 会同时起多个 gen，固定 pid 名会互相 unlink/读错文件
+      const tmp = path.join(os.tmpdir(), 'usage-detail-panel-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.html');
+      execFile(resolveBash(), [USAGE_SH, 'dashboard', tmp], { timeout: 120000, env: { ...process.env, ZCODE_USAGE_LIMIT: limitEnv } }, (err) => {
+        if (err) return rej2(new Error(err && err.code === 'ENOENT'
+          ? '未找到 bash（Windows 需安装 Git for Windows，或设置 ZCODE_BASH 指向 bash.exe）'
+          : '生成仪表盘失败：' + (err.message || err)));
+        try {
+          const frag = fs.readFileSync(tmp, 'utf8');
+          fs.unlinkSync(tmp);
+          res2(frag);
+        } catch (e) { rej2(e); }
+      });
+    });
+    const fullLimit = process.env.ZCODE_USAGE_LIMIT || '-1';
+    gen(fullLimit).then((frag) => {
+      const finish = (f, notice) => {
+        const html = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZCode 用量面板</title><style>' + SHELL_CSS + '</style></head><body style="padding:10px 12px 40px;max-width:none">' + (notice || '') + '<script>window.__USAGE_SERVE__=false;</script>' + f + '<script>' + TAB_JS + '</scr' + 'ipt></body></html>';
         dashCache = { at: Date.now(), html };
         resolve(html);
-      } catch (e) { reject(e); }
-    });
+      };
+      // 防御：宿主对页面资源读取有 8MiB 上限，逼近时自动降额到最近 5000 条重生成
+      if (fullLimit === '-1' && frag.length > 7 * 1024 * 1024) {
+        gen('5000').then((small) => {
+          const notice = '<div style="margin:0 0 10px;padding:8px 12px;border-radius:10px;background:var(--muted);font-size:12px;color:var(--muted-foreground)">历史数据过大（接近面板体积上限），侧栏已仅加载最近 5000 条；完整历史请用本地面板或 <code>usage.sh export</code>。</div>';
+          finish(small, notice);
+        }).catch(() => finish(frag)); // 降级失败就用全量（宁可大也不空白）
+        return;
+      }
+      finish(frag);
+    }).catch(reject);
   });
 }
 
@@ -387,13 +451,25 @@ const BUDGET_FILE = path.join(os.homedir(), '.zcode', 'usage-budget.json');
 const TURNSTATS_FILE = path.join(os.homedir(), '.zcode', 'usage-turnstats.json');
 const ALERTS_CFG = path.join(os.homedir(), '.zcode', 'usage-alerts.json');
 
-function atomicWrite(file, data) {
+function atomicWrite(file, data, mode) {
+  // 原子写 + Windows 兜底：rename 到被占用（杀毒/并发读）的目标会 EPERM——短重试后直写保功能
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  fs.writeFileSync(tmp, data, mode != null ? { mode } : undefined);
+  for (let i = 0; i < 3; i++) {
+    try { fs.renameSync(tmp, file); return; } catch (e) {
+      if (i === 2) {
+        try { fs.writeFileSync(file, data, mode != null ? { mode } : undefined); } catch (e2) {}
+        try { fs.unlinkSync(tmp); } catch (e2) {}
+        return;
+      }
+      const until = Date.now() + 60; while (Date.now() < until) { /* 短退避 */ }
+    }
+  }
 }
+// Windows 记事本等编辑器保存的 UTF-8 文件常带 BOM，JSON.parse 会直接抛错——读取后剥除
+const stripBom = (s) => String(s == null ? '' : s).replace(/^\uFEFF/, '');
 function readJsonCfg(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
+  try { return JSON.parse(stripBom(fs.readFileSync(file, 'utf8'))); } catch (e) { return fallback; }
 }
 function readPricesCfg() {
   const v = readJsonCfg(PRICES_FILE, null);
@@ -415,6 +491,26 @@ function writePricesCfg(next) {
 }
 function readBudgetCfg() { return readJsonCfg(BUDGET_FILE, { daily: 0, monthly: 0 }); }
 
+// 多厂商配额凭据（全部可选）：~/.zcode/usage-vendors.json，权限 0600。
+// 读取侧（vendor-quota.mjs）按 env → 文件顺序解析；此处只写入与回传「是否已配置」，绝不回传明文。
+const VENDOR_IDS = ['deepseek', 'kimi', 'openrouter', 'minimax'];
+function vendorKeysPath() { return path.join(os.homedir(), '.zcode', 'usage-vendors.json'); }
+function readVendorMask() {
+  const v = readJsonCfg(vendorKeysPath(), {}) || {};
+  return Object.fromEntries(VENDOR_IDS.map((id) => [id, { configured: !!(v[id] && (v[id].key || v[id].token)) }]));
+}
+function writeVendorKeys(keys) {
+  const cur = readJsonCfg(vendorKeysPath(), {}) || {};
+  for (const id of VENDOR_IDS) {
+    if (!(id in (keys || {}))) continue;
+    const k = String(keys[id] || '').trim();
+    if (k) cur[id] = { key: k };
+    else delete cur[id]; // 空串 = 清除该厂商凭据
+  }
+  atomicWrite(vendorKeysPath(), JSON.stringify(cur, null, 2) + '\n', 0o600);
+  return readVendorMask();
+}
+
 // 瘦身价格表：宿主对 structuredContent 有 64 KiB 上限（超限字段被省略），而同步后的全量
 // 价目有数千模型（数百 KiB），必须裁剪。默认只返回当前用量出现过的模型 + GLM 系内置价；
 // 传 query 时按模型名子串匹配（仍截断到 200 个）。前端弹框搜索走 query 参数按需取。
@@ -433,7 +529,7 @@ function slimPrices(query) {
     names = all.filter((m) => m.toLowerCase().indexOf(q) >= 0).slice(0, SLIM_MODELS_MAX);
   } else {
     const used = new Set(usedModelNames().map((m) => m.toLowerCase()));
-    names = all.filter((m) => used.has(m.toLowerCase()) || m.toLowerCase().indexOf('glm') >= 0).slice(0, SLIM_MODELS_MAX);
+    names = all.filter((m) => used.has(m.toLowerCase()) || /^(glm|deepseek)/.test(m.toLowerCase())).slice(0, SLIM_MODELS_MAX);
   }
   const models = {};
   for (const m of names) models[m] = p.models[m];
@@ -456,10 +552,14 @@ function writeSwitchesCfg(b) {
     const v = b.turnstats === 'off' ? { enabled: false } : { enabled: true, mode: b.turnstats };
     atomicWrite(TURNSTATS_FILE, JSON.stringify(v) + '\n');
   }
+  // alerts 单文件承载两个开关：侧栏开关逐个提交单字段，必须读旧值合并再写，
+  // 否则切「预算告警」会抹掉「权限提醒」（与 serve.mjs writeSwitches 同口径）
   const patch = {};
   if (typeof b.budgetAlerts === 'boolean') patch.budget = b.budgetAlerts;
   if (typeof b.permissionAlerts === 'boolean') patch.permission = b.permissionAlerts;
-  if (Object.keys(patch).length) atomicWrite(ALERTS_CFG, JSON.stringify(patch) + '\n');
+  if (Object.keys(patch).length) {
+    atomicWrite(ALERTS_CFG, JSON.stringify(Object.assign({}, readJsonCfg(ALERTS_CFG, {}), patch)) + '\n');
+  }
   return readSwitchesCfg();
 }
 
@@ -502,12 +602,12 @@ const TOOLS = [
   },
   {
     name: 'usage_quota',
-    description: '官方套餐配额查询（可选功能）：需在插件设置里配置智谱开放平台 API Key（quotaToken），未配置时返回配置指引。返回 5 小时池/周池/MCP 桠的官方用量百分比与重置时间。',
+    description: '多厂商配额聚合（可选功能）：GLM（零密钥客户端日志源）恒查；DeepSeek / Kimi / OpenRouter / MiniMax 在插件设置填写对应 API Key 后启用，Key 仅发送到对应厂商官方域名。返回各窗口已用百分比/余额与重置时间。',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     name: 'usage_settings_get',
-    description: '读取本地配置：价格表（含币种/汇率/自动同步，默认瘦身为主会话相关模型，query 可搜索全量）、预算、通知开关。',
+    description: '读取本地配置：价格表（含币种/汇率/自动同步，默认瘦身为主会话相关模型，query 可搜索全量）、预算、通知开关、多厂商配额 Key 配置状态（只回传是否已配置，不回传明文）。',
     inputSchema: {
       type: 'object',
       properties: { query: { type: 'string', description: '按模型名子串搜索价格（缺省只返回当前用量相关 + GLM 内置）' } },
@@ -517,15 +617,16 @@ const TOOLS = [
   },
   {
     name: 'usage_settings_set',
-    description: '写入本地配置（App-only，不经模型）：price 更新单模型价、priceGeneral 币种/汇率/自动同步、budget 日月预算、switches 通知开关、priceRemove 删除模型价。',
+    description: '写入本地配置（App-only，不经模型）：price 更新单模型价（可带 ctxOverride 覆盖上下文窗口）、priceGeneral 币种/汇率/自动同步、budget 日月预算、switches 通知开关、priceRemove 删除模型价、vendorKeys 多厂商配额 Key（写入本地凭据文件，不回传明文）。',
     inputSchema: {
       type: 'object',
       properties: {
-        price: { type: 'object', description: '{model,in,out,cache}' },
+        price: { type: 'object', description: '{model,in,out,cache,ctxOverride?}' },
         priceGeneral: { type: 'object', description: '{currency,usdCny,autoSync}' },
         priceRemove: { type: 'string', description: '要删除的模型名' },
         budget: { type: 'object', description: '{daily,monthly}' },
         switches: { type: 'object', description: '{turnstats:off|notify|inject, budgetAlerts:bool, permissionAlerts:bool}' },
+        vendorKeys: { type: 'object', description: '{deepseek?,kimi?,openrouter?,minimax?}：API Key，空串清除' },
       },
       additionalProperties: false,
     },
@@ -563,9 +664,14 @@ import { spawn } from 'node:child_process';
 let PLUGIN_VERSION = 'unknown';
 try { PLUGIN_VERSION = JSON.parse(fs.readFileSync(path.join(HERE, '..', '..', '.zcode-plugin', 'plugin.json'), 'utf8')).version || 'unknown'; } catch (e) {}
 
-function serveRunning() {
+const SERVE_PID_FILE = path.join(os.homedir(), '.zcode', 'usage-serve.json');
+function servePidFile() {
+  try { return JSON.parse(fs.readFileSync(SERVE_PID_FILE, 'utf8')); } catch (e) { return null; }
+}
+
+function serveRunning(port) {
   return new Promise((resolve) => {
-    const req = http2.get('http://127.0.0.1:7741/api/live', { timeout: 1200 }, (res) => {
+    const req = http2.get(`http://127.0.0.1:${port}/api/live`, { timeout: 1200 }, (res) => {
       let b = '';
       res.on('data', (c) => { b += c; });
       res.on('end', () => {
@@ -583,8 +689,16 @@ function serveRunning() {
 // 旧版本常驻 serve 缺新路由（如 /report.html、/api/turn）会 404：按 pid 文件重启它
 function killStaleServe() {
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.zcode', 'usage-serve.json'), 'utf8'));
-    if (!meta.pid || (meta.port && meta.port !== 7741)) return;
+    const meta = servePidFile();
+    if (!meta || !meta.pid) return; // pid+进程名校验已防误杀；端口不限（支持顺延端口上的旧实例）
+    if (process.platform === 'win32') {
+      // Windows 无 ps：tasklist 校验映像名后 taskkill（防 pid 被无关进程复用误杀）
+      const img = execFileSync('tasklist', ['/FI', `PID eq ${meta.pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' });
+      if (/node\.exe/i.test(img)) {
+        try { execFileSync('taskkill', ['/PID', String(meta.pid), '/F'], { stdio: 'ignore' }); } catch (e) {}
+      }
+      return;
+    }
     const cmd = execFileSync('ps', ['-p', String(meta.pid), '-o', 'command='], { encoding: 'utf8' });
     if (cmd.includes('serve.mjs')) {
       try { process.kill(meta.pid); } catch (e) {}
@@ -592,25 +706,43 @@ function killStaleServe() {
   } catch (e) {}
 }
 
+// 端口策略与 serve.mjs 对齐：默认 7741；被占时 serve 自动顺延 7742-7749 并把实际端口
+// 写进 usage-serve.json——这里以该文件为事实源返回真实地址，不再假设固定 7741
 async function ensureServe() {
-  const cur = await serveRunning();
+  const known = servePidFile();
+  const knownPort = known && known.port ? Number(known.port) : 7741;
+  const cur = await serveRunning(knownPort);
   if (cur.ok) {
-    if (cur.v === PLUGIN_VERSION) return { url: 'http://127.0.0.1:7741', started: false };
+    if (cur.v === PLUGIN_VERSION) return { url: `http://127.0.0.1:${knownPort}`, started: false };
     killStaleServe();
     for (let i = 0; i < 12; i++) {
       await new Promise((r) => setTimeout(r, 300));
-      if (!(await serveRunning()).ok) break;
+      if (!(await serveRunning(knownPort)).ok) break;
     }
+  } else if (knownPort !== 7741 && (await serveRunning(7741)).ok) {
+    // pid 文件丢失但默认端口上有活实例：跟随实际
+    const r = await serveRunning(7741);
+    if (r.ok && r.v === PLUGIN_VERSION) return { url: 'http://127.0.0.1:7741', started: false };
   }
-  const child = spawn('node', [path.join(HERE, '..', 'serve.mjs'), '7741'], { detached: true, stdio: 'ignore' });
+  // 不传端口启动：serve 在 7741 被占时自行顺延并回写 usage-serve.json
+  //（用 process.execPath 而非 PATH 里的 node：ZCode 内置 node 场景 PATH 可能没有）
+  const child = spawn(process.execPath, [path.join(HERE, '..', 'serve.mjs')], { detached: true, stdio: 'ignore' });
+  child.on('error', function () {});
   child.unref();
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 400));
-    if (await serveRunning().then((r) => r.ok)) return { url: 'http://127.0.0.1:7741', started: true };
+    const meta = servePidFile();
+    const p = meta && meta.port ? Number(meta.port) : 7741;
+    const r = await serveRunning(p);
+    if (r.ok) {
+      if (r.v === PLUGIN_VERSION) return { url: `http://127.0.0.1:${p}`, started: true };
+      // 起来的是旧版本（理论上刚被 kill 过）：按旧路径继续等/报错
+    }
   }
-  return { url: 'http://127.0.0.1:7741', started: false, error: '启动超时，可手动运行 usage.sh serve' };
+  return { url: `http://127.0.0.1:${knownPort}`, started: false, error: '启动超时，可手动运行 usage.sh serve' };
 }
 
+let quotaToolCache = { at: 0, v: null };
 function handleToolCall(name, args) {
   if (name === 'usage_summary') {
     return { structuredContent: buildSummary(), content: [{ type: 'text', text: '用量摘要已生成' }] };
@@ -630,21 +762,30 @@ function handleToolCall(name, args) {
   }
   if (name === 'usage_settings_get') {
     return {
-      structuredContent: { prices: slimPrices(args && args.query), budget: readBudgetCfg(), switches: readSwitchesCfg() },
+      structuredContent: { prices: slimPrices(args && args.query), budget: readBudgetCfg(), switches: readSwitchesCfg(), vendors: readVendorMask() },
       content: [{ type: 'text', text: '配置已读取' }],
     };
   }
   if (name === 'usage_settings_set') {
     let saved = { ok: true };
-    if (args && args.price && args.price.model) {
-      const m = String(args.price.model).trim();
-      if (m) {
-        const next = readPricesCfg();
-        const num = (v) => { const x = Number(v); return Number.isFinite(x) && x >= 0 ? x : 0; };
-        next.models[m] = { in: num(args.price.in), out: num(args.price.out), cache: num(args.price.cache) };
-        writePricesCfg(next);
+      if (args && args.price && args.price.model) {
+        const m = String(args.price.model).trim();
+        if (m) {
+          const next = readPricesCfg();
+          const num = (v) => { const x = Number(v); return Number.isFinite(x) && x >= 0 ? x : 0; };
+          const prevEntry = next.models[m] || {};
+          next.models[m] = { in: num(args.price.in), out: num(args.price.out), cache: num(args.price.cache) };
+          if (prevEntry.ctx != null) next.models[m].ctx = prevEntry.ctx; // 改价保留上下文窗口字段
+          const coRaw = args.price.ctxOverride; // 显式传空/0 = 清除覆盖；未传 = 保留原值（与 serve.mjs 同口径）
+          if (coRaw !== undefined) {
+            const co = Number(coRaw);
+            if (Number.isFinite(co) && co > 0) next.models[m].ctxOverride = Math.round(co);
+          } else if (prevEntry.ctxOverride != null) {
+            next.models[m].ctxOverride = prevEntry.ctxOverride;
+          }
+          writePricesCfg(next);
+        }
       }
-    }
     if (args && args.priceRemove) {
       const next = readPricesCfg();
       delete next.models[String(args.priceRemove).trim()];
@@ -660,24 +801,31 @@ function handleToolCall(name, args) {
     }
     if (args && args.budget) writeBudgetCfg(args.budget);
     if (args && args.switches) saved.switches = writeSwitchesCfg(args.switches);
+    if (args && args.vendorKeys) saved.vendors = writeVendorKeys(args.vendorKeys);
     // 附带保存后的瘦身价格表：面板保存成功直接软刷新（MCP App 沙箱内禁止 location.reload）
-    if (args && (args.price || args.priceRemove || args.priceGeneral)) saved.prices = slimPrices('');
+    if (args && (args.price || args.priceRemove || args.priceGeneral || args.vendorKeys)) saved.prices = slimPrices('');
     return {
       structuredContent: saved,
       content: [{ type: 'text', text: '配置已保存' }],
     };
   }
   if (name === 'usage_quota') {
-    if (!process.env.ZCODE_USAGE_QUOTA_TOKEN) {
-      return {
-        structuredContent: { configured: false },
-        content: [{ type: 'text', text: '未配置官方配额 API Key。请在 ZCode 插件设置里给 usage-detail 填写 quotaToken（智谱开放平台 bigmodel.cn 创建的 API Key），保存后重启即可查询官方 coding-plan 配额；也可以直接看 ZCode 的 Usage Stats → Coding Plan（零配置）。' }],
-      };
-    }
-    const out = execFileSync(process.execPath, [path.join(HERE, 'quota.mjs')], { encoding: 'utf8', timeout: 25000 });
-    const j = JSON.parse(out);
-    const lines = (j.limits || []).map((L) => (L.type || '配额') + '：已用 ' + Math.round(L.percentage || 0) + '%' + (L.resetTime ? '，' + L.resetTime + ' 重置' : ''));
-    return { structuredContent: j, content: [{ type: 'text', text: lines.length ? lines.join('\n') : '凭据可用但暂无配额观测。' }] };
+    // 多厂商配额聚合：GLM 零密钥（客户端日志源）恒查，其余厂商按已配置的 Key 查询。
+    // 结果缓存 60s：侧栏面板每次刷新都会调，避免频繁外网请求与子进程拉起。
+    const cached = quotaToolCache.v && Date.now() - quotaToolCache.at < 60000 ? quotaToolCache.v : null;
+    const load = cached
+      ? Promise.resolve(cached)
+      : import('../vendor-quota.mjs').then((mod) => mod.queryAllVendors()).then((j) => { quotaToolCache = { at: Date.now(), v: j }; return j; });
+    return load.then((j) => {
+      const blocks = (j.vendors || []).map((v) => {
+        if (!v.ok) return v.name + '：查询失败（' + ((v.error || '未知错误') + '').slice(0, 120) + '）';
+        return v.name + '\n' + (v.items || []).map((it) => '  ' + (it.label || '配额') + '：' + (it.pct != null ? '已用 ' + it.pct + '%' : String(it.text || '未知')) + (it.resets ? '，' + it.resets + ' 重置' : '')).join('\n');
+      });
+      const text = blocks.length
+        ? blocks.join('\n') + '\n\n（其他厂商可在插件设置里填写 API Key 启用：DeepSeek / Kimi / OpenRouter / MiniMax，Key 仅发送到对应厂商官方域名）'
+        : '暂无配额数据：GLM 零密钥日志源无观测，其他厂商未配置 Key。可在插件设置里填写 DeepSeek / Kimi / OpenRouter / MiniMax 的 API Key 启用聚合查询。';
+      return { structuredContent: j, content: [{ type: 'text', text }] };
+    }).catch((e) => ({ isError: true, content: [{ type: 'text', text: '配额查询失败：' + ((e && e.message) || e + '').slice(0, 200) }] }));
   }
   if (name === 'open_full_panel') {
     return ensureServe().then((r) => ({ structuredContent: r, content: [{ type: 'text', text: r.url + (r.started ? '（已启动）' : '（已在运行）') }] }));
@@ -685,7 +833,7 @@ function handleToolCall(name, args) {
   if (name === 'usage_prices_sync') {
     // 联网同步 models.dev 价格表（与 serve /api/sync-prices、usage.sh prices sync 同一实现）
     return new Promise((resolve) => {
-      execFile('bash', [USAGE_SH, 'prices', 'sync'], { timeout: 90000, env: process.env }, (err, stdout) => {
+      execFile(resolveBash(), [USAGE_SH, 'prices', 'sync'], { timeout: 90000, env: process.env }, (err, stdout) => {
         if (err) {
           resolve({ isError: true, content: [{ type: 'text', text: '同步失败：' + ((err.message || err) + '').slice(0, 300) }] });
           return;

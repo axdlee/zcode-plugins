@@ -6,23 +6,36 @@
 
 纯本地只读查询，**不发起任何网络请求，不上传任何数据**。
 
-![仪表盘总览](screenshots/dashboard-overview-dark.png)
+![仪表盘总览](../screenshots/dashboard-overview-dark.png)
 
 会话排行支持点击展开：上下文压缩、模型占比、使用工具、上下文水位曲线一目了然：
 
-![会话排行与钻取](screenshots/dashboard-sessions-dark.png)
+![会话排行与钻取](../screenshots/dashboard-sessions-dark.png)
 
 每日趋势按来源堆叠，图表下方附每日明细表（请求 / token / 缓存命中 / 生成速率），点击某天直接切换为该日的请求日志：
 
-![每日趋势](screenshots/dashboard-trend-light.png)
+![每日趋势](../screenshots/dashboard-trend-light.png)
 
 ## 功能
 
-> **平台支持**：macOS 完整支持；Windows 与 Linux 支持全部核心能力（侧栏面板 / MCP / 钩子 / 仪表盘 / CLI）——CLI 依赖 bash（Windows 用 Git Bash，无 sqlite3 时自动走 node 替身）与 Node ≥ 22.13（ZCode 自带）；系统通知按平台原生通道（osascript / WinRT toast / notify-send），不可用时静默。
+> **平台支持**：macOS 完整支持；Windows 与 Linux 支持全部核心能力（侧栏面板 / MCP / 钩子 / 仪表盘 / CLI）——CLI 依赖 bash（Windows 用 Git Bash；服务未在 PATH 找到 bash.exe 时自动探测 Git for Windows 常见安装位置，也可用 `ZCODE_BASH` 环境变量指定）、无 sqlite3 时自动走 node 替身（含 readfile 与 CSV 导出）与 Node ≥ 22.13（ZCode 自带）；系统通知按平台原生通道（osascript / WinRT toast / notify-send），不可用时静默；macOS 通知归因到 ZCode（显示 ZCode 图标而非「脚本编辑器」卷轴）；已安装 terminal-notifier（brew install terminal-notifier）时点击直达——预算/本轮统计点击打开本地面板，权限等待点击激活 ZCode 去批准；无 terminal-notifier 时点击打开 ZCode，ZCode 未运行则回退系统默认（0.22.2/0.22.3）。配置文件（价格表/开关/凭据）带 UTF-8 BOM 也能正常读取；本地写入在文件被占用时自动重试兜底（0.22.1）。
+
+- **界面语言 i18n**：跟随系统语言自动切换中/英（设置里可选「跟随系统 / 中文 / English」；本地面板切换即时生效，侧栏面板重开生效），页签、筛选、KPI、洞察、表头、按钮、空态、设置弹窗、tooltip 与「本轮」实时横幅全量双语；英文模式数字单位用 K/M/B（中文用 万/亿）；缺失词条自动回退中文。语言判定顺序：手动选择 → **ZCode 自身界面语言偏好**（`~/.zcode/v2/setting.json` 的 `localePreference`，侧栏/本地视图）→ 浏览器/WebView 语言（浏览器打开的网页恒跟随浏览器）。已知边界：CLI 输出、系统通知文本、SVG 无障碍描述（aria-label/desc）暂为中文；会话标题、模型/来源名、配额桶名属数据不翻译（0.23.0，0.23.1/0.23.2 补全）
+- **昨天筛选与文本搜索**：时间档位新增「昨天」（洞察环比自动变为「昨日 vs 前日」）；控制条新增文本搜索框（会话标题 / 模型 / 来源大小写不敏感包含，200ms 防抖）（0.23.0）
+- **今日预算进度卡**：设置日预算后洞察区常驻「今日折算 / 预算 · 百分比」，80% 金色、100% 红色，与系统告警阈值呼应；恒按今天全量口径（不随筛选变化）（0.23.0）
+- **自动刷新**：本地面板控制条新增「Auto ON/OFF」开关（60s 整页刷新，状态记忆；页签 hash 保留），挂机监控不用手点刷新（0.23.0）
+- **燃烧率与节奏**：近 1h tok/min + 折算金额常驻洞察前排，按近 7 天日均给出「放缓 / 平稳 / 加速」节奏标记
+- **项目用量页签**：按项目聚合（会话数 / 请求 / token / 近 7 天 sparkline），点击项目行筛选会话表。项目取**真实 git 仓库根**：在子目录 / 孙目录里开的会话自动归并到所在项目，不再出现深层目录冒充项目名；目录已删、非 git 仓库或未安装 git（Windows 常见）时退化为按原目录分组（0.22.0）
+- **BYOK 供应商显示名**：设置里添加的自定义接入（provider_id 常为 `new-provider`）自动显示为你在 `provider_config.json` 里命名的名称（如 `hub-linuxdo`）；插件只读取名称映射，不读取也不外发该文件中的 API Key（0.22.0）
+- **模型名归一**：同一模型以多种大小写形态入库（如 `GLM-5.3-Flash` / `glm-5.3-flash`）时自动合并为一行/一个筛选项，显示名取用量最大的形态（0.22.0）
+- **计费窗口（近似）**：本地 5h 切分（与 ccusage blocks 同口径），最近 8 个窗口横条对比，活跃窗口带全窗投影
+- **端口自适应**：本地面板默认 7741；被其他应用占用时自动顺延 7742-7749（日志与「打开面板」入口始终指向实际端口），你显式指定的端口被占则明确报错（0.22.4）
+- **状态栏一行摘要**：`usage.sh statusline` 输出「今日 token · 折算 · 燃烧率 · 预算 %」，可挂 tmux / SwiftBar
+- **动效**：KPI 数字滚动、页签淡入、横幅呼吸脉点、热力图悬停描边——尊重系统减弱动效设置
 
 - **逐条明细**：每次模型请求一行——时间、会话、模型、来源、主会话/子代理、输入/缓存读/缓存写/生成/合计 token、耗时、首字延迟、**输出速率 tok/s**（六档变色）、状态、每行折算成本（API 牌价，可开关）；分页浏览、点表头排序
 - **会话侧栏面板**（ZCode Desktop 3.15+）：**与 `/usage-ui` 完整版同一份界面**（不是简化版）——六个标签页、热力图、趋势、每日明细、会话钻取、模型效率、请求分页/排序/钻取全部可用，明暗主题跟随宿主，由插件内置零依赖 MCP 服务按需生成（默认**内嵌全部历史**，插件设置里可自定义数据库路径与聚合条数）。图表悬停即时显示明细（含 token 与缓存率）；时段分布支持「请求 / token」指标切换；明细分页支持页码直跳
-- **每轮用量实时卡**：每轮回合结束由本地脚本统计（零模型开销、不进上下文），经 MCP 资源订阅实时推送到侧栏面板顶部「⏱ 本轮」横幅；可选系统通知（macOS / Windows / Linux）或对话内统计行（`usage.sh turnstats`，默认仅侧栏卡）
+- **每轮用量实时卡**：每轮回合结束由本地脚本统计（零模型开销、不进上下文），经 MCP 资源订阅实时推送到侧栏面板顶部「⏱ 本轮」横幅；统计未开启或订阅不可用时，横幅自动退回按已加载数据的 `turn_id` 聚合展示最新一轮（标注「截至 HH:MM 数据」），任何环境下都有本轮可见；可选系统通知（macOS / Windows / Linux）或对话内统计行（`usage.sh turnstats`，默认仅侧栏卡）（0.22.0 补兜底）
 - **预算 / 燃烧告警**（零模型开销）：本地面板常驻时每分钟本地检查——日折算成本达日预算 80%/100% 时弹 macOS 通知（各档每日最多一次），今日 token 超近 7 天日均 50% 也会提醒；`usage.sh alerts budget off` 可关
 - **权限等待提醒**（默认关）：Agent 弹出权限批准请求时发 macOS 通知，挂机跑长任务不漏确认；`usage.sh alerts permission on` 开启
 - **浪费取证**：失败 / 取消请求白耗的 token 一眼看穿——洞察卡带汇总，`usage.sh waste [N天]` 出近 N 天详单（失败/取消/重试口径 + 反复失败会话 Top5 + 重试最多模型）
@@ -38,21 +51,21 @@
 - **活跃热力图**：GitHub 提交风格，按天 token 四分位着色，悬停看当日明细；粒度「每日 / 每周 / 月历」三态切换（月历为最近 3 个月日历视图）
 - **健康度卡片**：平均首字延迟、生成速率、错误率、峰值上下文水位、工具调用次数与总耗时，一行体检指标
 - **每日明细 + 每月汇总**：趋势页图表下方附逐日表（请求 / token / 缓存命中 / 生成速率）与逐月汇总表（含折算成本），点击某天直接切换为该日的请求日志
-- **官方配额（可选接入）**：默认不显示（官方口径看 ZCode 的 Usage Stats → Coding Plan）；在插件设置里填入智谱开放平台 API Key（quotaToken）后，本地面板显示官方配额卡、MCP 工具 `usage_quota` 可查询；均未配置时如实提示，不做猜测
+- **多厂商配额聚合（可选接入）**：总览页配额卡与 MCP 工具 `usage_quota` 聚合显示各厂商用量——GLM 零密钥（自动读客户端日志观测）；DeepSeek（余额）、Kimi（5 小时/周窗口）、OpenRouter（预付额度）、MiniMax（Token Plan）在设置里填入各自 API Key 后启用。Key 仅发送到对应厂商官方域名做只读查询，保存在本地 `~/.zcode/usage-vendors.json`（权限 0600），可随时清除；未配置时如实提示，不做猜测
 - **折算成本（API 牌价，CNY）**：GLM 5.3 系内置智谱官网权威牌价（¥/百万 token，与官方定价页一致）；其余模型从 [models.dev](https://models.dev) 全量同步并按 USD→CNY 汇率换算（`ZCODE_USAGE_USD_CNY` 可改）；自定义条目与官方权威条目不会被同步覆盖。订阅套餐请求不按 token 计费，金额仅表示等量 API 用量的牌价价值。仪表盘有"折算成本"开关与"同步价格"按钮
-- **分时计价**：支持按请求本地时间取档的峰/谷/夜间价格（官方套餐高峰/低峰时段单价不同、其他模型同理），在价格表里加 `tariff` 字段即可生效：
+- **分时计价（峰谷定价）**：按每条请求的本地时间取档计价（官方套餐高峰/低峰时段单价不同、其他模型同理），在价格表里加 `tariff` 字段即可生效：
 
   ```json
-  { "currency": "USD",
-    "models": { "glm-5.3": { "in": 1.4, "out": 4.4, "cache": 0.26,
-      "tariff": { "tz": 8,
+  { "currency": "CNY",
+    "models": { "deepseek-flash": { "in": 2, "out": 8, "cache": 0.04,
+      "tariff": { "tz": 8, "weekend": 0.5,
         "tiers": [
-          { "hours": [[9, 12], [14, 18]], "mult": 1.0, "name": "峰" },
-          { "hours": [[0, 8]], "mult": 0.5, "name": "谷" } ] } } } }
+          { "hours": [[9, 12], [14, 18]], "mult": 1.0, "name": "高峰" },
+          { "hours": [[0, 24]], "mult": 0.5, "name": "空闲" } ] } } } }
   ```
 
-  不配置 `tariff` 时按基础价计算，行为不变。
-- **套餐配额查询**（`quota`，CLI 可选）：余量显示因账号/套餐类型差异较大（客户端凭据为加密托管，日志并非对所有套餐包含 5 小时池/周池观测），**界面里不再渲染配额卡**——套餐余量请直接查看 ZCode 的 **Usage Stats → Coding Plan**（官方口径最准）。本子命令保留给需要它的 API Key 用户：写入 `~/.zcode/usage-quota-token.json`（`{"token":"你的KEY","base":"https://open.bigmodel.cn"}`）后可查监控接口
+  `weekend` 为可选的周末统一倍率（周六/日全天，如 DeepSeek 周末按空闲价）；`holidays` / `workdays` 为可选的法定节假日与调休上班日列表（`"YYYY-MM-DD"`，按 `tz` 口径）——节假日全天按 `weekend` 倍率计空闲价，调休上班的周末按正常分时档。历史请求按各自发生时刻取档。**洞察区「当前时段」行**按系统当前时间实时判定所处档位（取用量最大的分时模型为代表）。**内置 DeepSeek 官方峰谷牌价**（deepseek-flash / deepseek-v4-flash / deepseek-v4-pro，2026-10 核对官方价目页：工作日 9:00–12:00、14:00–18:00 高峰，周末与法定节假日全天空闲半价）与 **2026 年国务院办公厅节假日安排**（含 6 天调休上班日，2025-11-04 通知）——重跑 `prices sync` 即更新到本地价格表；新年份安排公布后随插件内置表更新，也可自行编辑 `tariff.holidays`。**GLM Coding Plan 积分峰谷**（工作日 14:00–18:00 按 1× 抵扣、其余 0.5×，2026-10 核对官方套餐文档）在配额卡的 GLM 厂商块实时提示。不配置 `tariff` 时按基础价计算，行为不变。
+- **套餐配额查询**（`quota`，CLI 可选）：GLM 余量因账号/套餐类型差异较大（客户端凭据为加密托管，日志并非对所有套餐包含 5 小时池/周池观测），优先零密钥解析客户端日志里的额度观测；界面侧的多厂商聚合见上方「多厂商配额聚合」，本子命令面向 CLI 场景保留：写入 `~/.zcode/usage-quota-token.json`（`{"token":"你的KEY","base":"https://open.bigmodel.cn"}`）后可查监控接口
 - **本地常驻面板**（`serve`）：一条命令在本机起一个只读 Web 服务，浏览器打开即得常驻看板——数据一次加载，燃烧率每 5 秒轻量轮询实时刷新，支持两级钻取与原始用量查看，不占会话上下文
 - **导出**：`export csv` / `export json` 全量记录（CSV 遵循 RFC 4180）
 - **零依赖**：只用 macOS / Linux 自带的 `bash` + `sqlite3`，不需要 Node / Python
@@ -193,19 +206,20 @@ notify/inject 需重开会话生效（hook 配置按会话快照）；侧栏实�
 
 每日趋势按来源堆叠，图表下方附每日明细表（请求 / token / 缓存命中 / 生成速率），点击某天直接切换为该日的请求日志：
 
-![每日趋势](screenshots/dashboard-trend-light.png)
+![每日趋势](../screenshots/dashboard-trend-light.png)
 
 请求明细支持状态筛选与表头排序：
 
-![请求明细](screenshots/dashboard-detail-light.png)
+![请求明细](../screenshots/dashboard-detail-light.png)
 
 ## 数据说明与隐私
 
 - 数据源是 ZCode 客户端自动写入的本地 SQLite（`~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表），本插件只做**只读**查询
 - 不联网、不上传、不写库；仪表盘数据在生成时内嵌，仅存在于你自己机器上的一个 HTML 文件
 - 仪表盘默认内嵌最近 3000 条请求，`/usage-ui <条数>` 可调整（1–20000；超过约 8000 条可能超出会话内嵌渲染的体积限制，全量历史请用 `export json`）
-- token 口径：输入列含缓存命中（缓存读单独列出），生成 = 输出 + 思考
+- token 口径：输入列含缓存命中（缓存读单独列出），生成 = 输出 + 思考；成本按「未命中输入 × 牌价 in + 缓存命中 × 牌价 cache + 生成 × 牌价 out」计价（命中段不重复计费，含分时费率模型按各请求发生时刻取档）
 - **套餐配额余量**（5 小时池 / 周额度）由服务端计量，不在本地库中：`/usage quota` 优先零密钥解析客户端日志里的额度观测；因账号/套餐类型而异，部分观测（如 5 小时池）可能为空，此时请以 ZCode 的 **Usage Stats → Coding Plan** 为准，或配置 API 凭据启用监控接口
+- **多厂商配额（全部可选，默认关闭）**：仅在插件设置里填写对应厂商 API Key 后，才会向该厂商**官方域名**发起只读查询——DeepSeek `api.deepseek.com`、Kimi `api.kimi.com`、OpenRouter `openrouter.ai`、MiniMax `api.minimaxi.com`；Key 保存在 `~/.zcode/usage-vendors.json`（权限 0600），不出现在日志与导出中；GLM 配额查询不发送任何凭据（解析本地客户端日志）。不填 Key 即零外联
 
 ## 已知限制
 
