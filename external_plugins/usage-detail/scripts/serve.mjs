@@ -40,6 +40,11 @@ function q(sql) {
 }
 // turn_id 是较新 ZCode 才有的列：老库直接 SELECT 会 prepare 失败，先探测再拼表达式
 const TURN_EXPR = q("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='turn_id'") === '1' ? 'R.turn_id' : 'NULL';
+// agent / context_exceeded 同为较新列：老库回退（agent 置空显示未知来源，ctx 置 NULL 无超限标注）
+const AGENT_EXPR = q("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='agent'") === '1' ? 'mu.agent' : "''";
+const CTX_EXC_EXPR = q("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='context_exceeded'") === '1' ? 'R.context_exceeded' : 'NULL';
+// 子代理会话归属：session.parent_id（较新列）把子会话挂到主会话；老库无此列时留在子会话名下
+const PARENT_EXPR = q("SELECT count(*) FROM pragma_table_info('session') WHERE name='parent_id'") === '1' ? 'ch.parent_id' : 'NULL';
 
 function pricePath() {
   if (process.env.ZCODE_USAGE_PRICES && fs.existsSync(process.env.ZCODE_USAGE_PRICES)) return process.env.ZCODE_USAGE_PRICES;
@@ -58,17 +63,21 @@ const META_SQL = (pfText, limit, disk, extraJson) => `
     'providers',(SELECT json_group_array(v) FROM (SELECT v,i FROM P ORDER BY i)),
     'models',(SELECT json_group_array(v) FROM (SELECT v,i FROM M ORDER BY i)),
     'sessions',(SELECT json_group_array(coalesce(se.title,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
+    'sessionIds',(SELECT json_group_array(v) FROM (SELECT v,i FROM S ORDER BY i)),
     'sessionDirs',(SELECT json_group_array(coalesce(se.directory,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
     'tools',(SELECT COALESCE(json_group_array(json_array(tool_name, c, f, d)),'[]') FROM (SELECT tool_name, count(*) AS c, sum(status<>'completed') AS f, CAST(round(avg(duration_ms)) AS int) AS d FROM tool_usage GROUP BY tool_name ORDER BY c DESC LIMIT 8)),
     'todos',(SELECT json_array(sum(CASE WHEN status='completed' THEN 1 ELSE 0 END), count(*)) FROM todo),
     'stability',(SELECT json_array(COALESCE(sum(retry_count),0), COALESCE(sum(cancelled_by_user),0), COALESCE(sum(CASE WHEN status='error' THEN 1 ELSE 0 END),0)) FROM model_usage),
     'hours',(SELECT COALESCE(json_group_object(hr, c),'{}') FROM (SELECT strftime('%H', started_at/1000,'unixepoch','localtime') AS hr, count(*) AS c FROM model_usage GROUP BY hr)),
-    'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+    'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts), json(c.triggers))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts, json_group_array(COALESCE(json_extract(p.data,'$.trigger'),'manual') || '/' || COALESCE(json_extract(p.data,'$.phase'),'')) AS triggers FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+        'ctxMix',(SELECT COALESCE(json_group_array(json_array(SI.i, m.t, m.b)),'[]') FROM (SELECT p.session_id AS sid, json_extract(p.data,'$.type') AS t, sum(length(p.data)) AS b FROM part p WHERE p.session_id IN (SELECT DISTINCT session_id FROM R) AND p.session_id IS NOT NULL GROUP BY p.session_id, json_extract(p.data,'$.type')) m LEFT JOIN S SI ON SI.v = m.sid WHERE SI.i IS NOT NULL),
+        'sessionAgents',(SELECT COALESCE(json_group_array(json_array(SI.i, a.agent, a.c, a.tok)),'[]') FROM (SELECT COALESCE(${PARENT_EXPR}, mu.session_id) AS root_sid, COALESCE(NULLIF(${AGENT_EXPR},''),'-') AS agent, count(*) AS c, sum(mu.input_tokens+mu.output_tokens+mu.reasoning_tokens) AS tok FROM R mu LEFT JOIN session ch ON ch.id = mu.session_id WHERE mu.query_source='subagent' GROUP BY 1, 2) a LEFT JOIN S SI ON SI.v = a.root_sid WHERE SI.i IS NOT NULL),
     'sessionTools',(SELECT COALESCE(json_group_array(json_array(SI.i, t.tool, t.c, t.ms)),'[]') FROM (SELECT session_id AS sid, tool_name AS tool, count(*) AS c, CAST(sum(duration_ms) AS int) AS ms FROM tool_usage GROUP BY session_id, tool_name) t LEFT JOIN S SI ON SI.v = t.sid WHERE SI.i IS NOT NULL),
     'disk', json('${JSON.stringify(disk).replace(/'/g, "''")}'),
     'providerNames', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."providerNames"'),
     'projectMap', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."projectMap"'),
     'budgetDaily', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetDaily"'),
+    'userLang', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."userLang"'),
     'budgetMonthly', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."budgetMonthly"'),
     'prices',(SELECT CASE
               WHEN pj IS NULL OR NOT json_valid(pj) THEN json('{}')
@@ -89,7 +98,7 @@ const META_SQL = (pfText, limit, disk, extraJson) => `
               R.duration_ms,
               CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
               CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${TURN_EXPR}))
+              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${TURN_EXPR}, ${CTX_EXC_EXPR}))
             FROM R
             LEFT JOIN S SI ON SI.v = R.session_id
             LEFT JOIN M MI ON MI.v = R.model_id
@@ -173,6 +182,59 @@ function writeVendorKeys(keys) {
   return readVendorMask();
 }
 function budgetPath() { return path.join(os.homedir(), '.zcode', 'usage-budget.json'); }
+// 界面语言持久层（usage-lang.json）：跨面板（本地面板/侧栏/生成页）权威的显式选择，''=跟随系统
+const LANG_FILE = path.join(os.homedir(), '.zcode', 'usage-lang.json');
+function readLangPref() {
+  try {
+    const v = String(JSON.parse(stripBom(fs.readFileSync(LANG_FILE, 'utf8'))).language || '');
+    return v === 'zh' || v === 'en' ? v : '';
+  } catch (e) { return ''; }
+}
+function writeLangPref(v) {
+  atomicWrite(LANG_FILE, JSON.stringify({ language: v === 'zh' || v === 'en' ? v : '' }) + '\n');
+}
+// 上下文 Top 下钻（按会话按需查询，不随 dashboard 全量内嵌）：
+// 工具字节 Top（part type=tool 按工具聚合）+ 文件字节 Top（Read/Edit/Write 的 file_path 参数聚合）。
+// 口径与构成环一致（part 存储字节近似）。老库无 part 表时 prepare 抛错，返回空表。
+const CTX_TOP_SQL = `WITH P AS (SELECT data, time_created AS tc, length(data) AS b, json_extract(data,'$.type') AS t FROM part WHERE session_id = ?)
+  SELECT
+    (SELECT COALESCE(json_group_array(json_array(t.tool, t.c, t.b)),'[]') FROM (
+       SELECT json_extract(data,'$.tool') AS tool, count(*) AS c, sum(length(data)) AS b
+       FROM P WHERE json_extract(data,'$.type')='tool' GROUP BY 1 ORDER BY b DESC LIMIT 8) t) AS tools,
+    (SELECT COALESCE(json_group_array(json_array(f.path, f.c, f.b)),'[]') FROM (
+       SELECT json_extract(data,'$.state.input.file_path') AS path, count(*) AS c, sum(length(data)) AS b
+       FROM P WHERE json_extract(data,'$.type')='tool'
+         AND json_extract(data,'$.tool') IN ('Read','Edit','Write')
+         AND json_extract(data,'$.state.input.file_path') IS NOT NULL
+       GROUP BY 1 ORDER BY b DESC LIMIT 8) f) AS files,
+    (SELECT COALESCE(json_group_array(json_array(g.agent, g.started_at, g.duration_ms, g.tok, g.sid)),'[]') FROM (
+       SELECT COALESCE(NULLIF(${AGENT_EXPR},''),'-') AS agent, mu.started_at AS started_at, mu.duration_ms AS duration_ms,
+              mu.input_tokens+mu.output_tokens+mu.reasoning_tokens AS tok, mu.session_id AS sid
+       FROM model_usage mu LEFT JOIN session ch ON ch.id = mu.session_id
+       WHERE COALESCE(${PARENT_EXPR}, mu.session_id) = ? AND mu.query_source = 'subagent'
+       ORDER BY mu.started_at LIMIT 500) g) AS fleet,
+    (SELECT COALESCE(json_group_array(json_array(g.t, g.c, g.b, g.r1c, g.r1b)),'[]') FROM (
+       SELECT t, count(*) AS c, sum(b) AS b,
+              sum(CASE WHEN tc >= (strftime('%s','now') * 1000 - 3600000) THEN 1 ELSE 0 END) AS r1c,
+              sum(CASE WHEN tc >= (strftime('%s','now') * 1000 - 3600000) THEN b ELSE 0 END) AS r1b
+       FROM P WHERE t NOT IN ('step-start','step-finish','timeline') GROUP BY t ORDER BY b DESC) g) AS bgroups,
+    (SELECT COALESCE(json_group_array(json_array(i.t, i.tc, i.b, i.sn, i.sbody)),'[]') FROM (
+       SELECT t, tc, b, sn, sbody FROM (
+         SELECT t, tc, b,
+           CASE t WHEN 'tool' THEN json_extract(data,'$.tool') WHEN 'text' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 600) WHEN 'reasoning' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 600) WHEN 'file' THEN COALESCE(json_extract(data,'$.url'), '') WHEN 'compaction' THEN COALESCE(json_extract(data,'$.trigger'), '') || '/' || COALESCE(json_extract(data,'$.phase'), '') ELSE '' END AS sn,
+           CASE t WHEN 'tool' THEN substr(COALESCE(json_extract(data,'$.state.input'), json_extract(data,'$.state.output'), ''), 1, 800) WHEN 'text' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 800) WHEN 'reasoning' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 800) ELSE '' END AS sbody,
+           row_number() OVER (PARTITION BY t ORDER BY b DESC) AS rn
+         FROM P WHERE t NOT IN ('step-start','step-finish','timeline')
+       ) WHERE rn <= 30 ORDER BY b DESC LIMIT 150) i) AS bitems`;
+function ctxTop(sid) {
+  sid = String(sid || '').slice(0, 128);
+  if (!sid) return { tools: [], files: [], fleet: [], bgroups: [], bitems: [] };
+  try {
+    const row = db.prepare(CTX_TOP_SQL).get(sid, sid);
+    const j = (v) => { try { return JSON.parse(v) || []; } catch (e) { return []; } };
+    return { tools: j(row && row.tools), files: j(row && row.files), fleet: j(row && row.fleet), bgroups: j(row && row.bgroups), bitems: j(row && row.bitems) };
+  } catch (e) { return { tools: [], files: [], fleet: [], bgroups: [], bitems: [] }; } // 老库无 part 表
+}
 function readBudget() {
   try { return JSON.parse(stripBom(fs.readFileSync(budgetPath(), 'utf8'))); } catch (e) { return { daily: 0, monthly: 0 }; }
 }
@@ -228,7 +290,7 @@ function dataJSON(limit) {
   // 全新环境表还不存在（ZCode 尚未写入）：直接空数据，避免 META SQL 报 no such table。
   // 注意消费方按字符串处理（res.end(dataJSON())），必须 stringify
   if (q("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')") !== '2') {
-    return JSON.stringify({ providers: [], models: [], sessions: [], sessionDirs: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk: diskJSON(), providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, prices: {}, total: 0, covered: 0, rows: [] });
+    return JSON.stringify({ providers: [], models: [], sessions: [], sessionDirs: [], sessionIds: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk: diskJSON(), providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, userLang: readLangPref(), ctxMix: [], sessionAgents: [], prices: {}, total: 0, covered: 0, rows: [] });
   }
   // node:sqlite 没有 CLI 的 readfile()：价格文件内容在 node 侧读好后内联（单引号转义）
   const pp = pricePath();
@@ -236,7 +298,7 @@ function dataJSON(limit) {
   const dirs = q(`SELECT COALESCE(json_group_array(d),'[]') FROM (SELECT DISTINCT se.directory AS d FROM model_usage u LEFT JOIN session se ON se.id=u.session_id WHERE coalesce(se.directory,'')<>'')`).trim() || '[]';
   let dirsList = [];
   try { dirsList = JSON.parse(dirs); } catch (e) {}
-  return q(META_SQL(pfText, limit, diskJSON(), JSON.stringify({ providerNames: providerNames(), projectMap: projectMap(dirsList) })));
+  return q(META_SQL(pfText, limit, diskJSON(), JSON.stringify({ providerNames: providerNames(), projectMap: projectMap(dirsList), userLang: readLangPref(), budgetDaily: readBudget().daily, budgetMonthly: readBudget().monthly })));
 }
 
 function liveJSON() {
@@ -341,7 +403,7 @@ function renderFragment(limit, forServe) {
   // 导出报告（forServe=false）必须保留内嵌 DATA——自包含快照脱离本机后无 API 可拉，
   // 否则 boot 的 fetch 失败、整页只剩静态骨架（曾因无条件替换导致报告导出空数据）。
   if (forServe !== false) {
-    html = html.replace(/^const DATA =\n.*$/m, "const DATA = null;\nwindow.__USAGE_DATA_URL__ = '/api/data';\nwindow.__USAGE_SERVE__ = true;");
+    html = html.replace(/^const DATA =\n.*$/m, "const DATA = null;\nwindow.__USAGE_DATA_URL__ = '/api/data';\nwindow.__USAGE_SERVE__ = true;\nwindow.__USAGE_LANG__ = " + JSON.stringify(readLangPref()) + ";");
     if (html.indexOf('__USAGE_DATA_URL__') < 0) throw new Error('dashboard 生成结果异常');
   // 服务态附加：刷新按钮 + 自动刷新开关（挂机监控；页签 hash 在 reload 后保留）+ 实时燃烧率角标（5s 轻轮询）
   html += `<script>
@@ -507,6 +569,9 @@ const server = http.createServer(async function (req, res) {
     } else if (req.method === 'GET' && u.pathname === '/api/data') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(dataJSON(u.searchParams.get('limit')));
+    } else if (req.method === 'GET' && u.pathname === '/api/ctx') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(ctxTop(u.searchParams.get('session'))));
     } else if (req.method === 'GET' && u.pathname === '/api/quota') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(await quotaJSON()));
@@ -573,6 +638,12 @@ const server = http.createServer(async function (req, res) {
       writeBudget(b);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true }));
+    } else if (req.method === 'POST' && u.pathname === '/api/lang') {
+      const b = await readBody(req);
+      writeLangPref(b && b.language);
+      frag.html = null; // 片段缓存失效：下次页面生成烧入新语言
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, language: readLangPref() }));
     } else if (req.method === 'GET' && u.pathname === '/api/switches') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(readSwitches()));

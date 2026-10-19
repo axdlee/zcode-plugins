@@ -45,9 +45,21 @@ cmd_dashboard() {
     rollout_mb=$(du -sm "$HOME/.zcode/cli/rollout" 2>/dev/null | cut -f1 || true); rollout_mb=${rollout_mb:-0}
     artifacts_mb=$(du -sm "$HOME/.zcode/cli/artifacts" 2>/dev/null | cut -f1 || true); artifacts_mb=${artifacts_mb:-0}
     db_mb=$(du -m "$DB" 2>/dev/null | cut -f1 || true); db_mb=${db_mb:-0}
+    # 全新环境：model_usage/session 表还不存在（ZCode 尚未写入）→ 直接给空数据，避免 META SQL 报 no such table
+    if [[ "$(qr "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')")" != "2" ]]; then
+      META='{"providers":[],"models":[],"sessions":[],"sessionDirs":[],"sessionIds":[],"tools":[],"todos":[0,0],"stability":[0,0,0],"hours":{},"compactions":[],"sessionTools":[],"disk":{"logs":0,"rollout":0,"artifacts":0,"db":0},"providerNames":{},"projectMap":{},"budgetDaily":0,"budgetMonthly":0,"zcodeLocale":"","userLang":"","ctxMix":[],"sessionAgents":[],"prices":{},"total":0,"covered":0,"rows":[]}'
+    else
     # turn_id 是较新 ZCode 才有的列：老库直接 SELECT 会 prepare 失败，先探测再拼表达式
     turn_expr="NULL"
     [[ "$(qr "SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='turn_id'")" == "1" ]] && turn_expr="R.turn_id"
+    # agent / context_exceeded 同为较新列：老库回退（agent 置空显示未知来源，ctx 置 NULL 无超限标注）
+    agent_expr="''"
+    [[ "$(qr "SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='agent'")" == "1" ]] && agent_expr="mu.agent"
+    # 子代理会话归属：session.parent_id（较新列）把子会话挂到主会话；老库无此列时子代理团队留在子会话名下
+    parent_expr="NULL"
+    [[ "$(qr "SELECT count(*) FROM pragma_table_info('session') WHERE name='parent_id'")" == "1" ]] && parent_expr="ch.parent_id"
+    ctx_exc_expr="NULL"
+    [[ "$(qr "SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='context_exceeded'")" == "1" ]] && ctx_exc_expr="R.context_exceeded"
     # BYOK 供应商显示名（provider_config.json，只取名映射）+ 项目根归并（git 仓库根）：
     # node 一次性解析成两个映射表进 META；node/git 不可用或空目录时给空表，前端按原样回退。
     # dirs 走 stdin：Git Bash(MSYS) 会改写 argv 里以 / 开头的路径参数，JSON 清单会被篡改
@@ -63,10 +75,9 @@ cmd_dashboard() {
     # 只取显式语言（system=跟随系统时留空，前端回退 navigator.language）；严格校验格式防注入
     ZLOC=$(node -e "try{const s=JSON.parse(require('fs').readFileSync(require('path').join(process.env.HOME||'', '.zcode', 'v2', 'setting.json'),'utf8'));const p=String(s.localePreference||'');process.stdout.write(p&&p!=='system'?p:'')}catch(e){process.stdout.write('')}" 2>/dev/null || echo "")
     [[ "$ZLOC" =~ ^[a-zA-Z]{2,8}(-[a-zA-Z0-9]{1,8})*$ ]] || ZLOC=''
-    # 全新环境：model_usage/session 表还不存在（ZCode 尚未写入）→ 直接给空数据，避免 META SQL 报 no such table
-    if [[ "$(qr "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')")" != "2" ]]; then
-      META='{"providers":[],"models":[],"sessions":[],"sessionDirs":[],"tools":[],"todos":[0,0],"stability":[0,0,0],"hours":{},"compactions":[],"sessionTools":[],"disk":{"logs":0,"rollout":0,"artifacts":0,"db":0},"providerNames":{},"projectMap":{},"budgetDaily":0,"budgetMonthly":0,"zcodeLocale":"","prices":{},"total":0,"covered":0,"rows":[]}'
-    else
+    # 用户显式语言选择（usage-lang.json，由本地面板/侧栏设置写入）：跨面板权威，优先于 localStorage
+    ULANG=$(node -e "try{const b=JSON.parse(require('fs').readFileSync(require('path').join(process.env.HOME||'', '.zcode', 'usage-lang.json'),'utf8'));const v=String(b.language||'');process.stdout.write(v==='zh'||v==='en'?v:'')}catch(e){process.stdout.write('')}" 2>/dev/null || echo "")
+
     META=$(qr "
       WITH U AS (SELECT * FROM model_usage $scope),
            P AS (SELECT provider_id AS v, row_number() OVER (ORDER BY provider_id)-1 AS i FROM (SELECT DISTINCT provider_id FROM U)),
@@ -83,12 +94,15 @@ cmd_dashboard() {
         'providers',(SELECT json_group_array(v) FROM (SELECT v,i FROM P ORDER BY i)),
         'models',(SELECT json_group_array(v) FROM (SELECT v,i FROM M ORDER BY i)),
         'sessions',(SELECT json_group_array(coalesce(se.title,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
+    'sessionIds',(SELECT json_group_array(v) FROM (SELECT v,i FROM S ORDER BY i)),
         'sessionDirs',(SELECT json_group_array(coalesce(se.directory,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
         'tools',(SELECT COALESCE(json_group_array(json_array(tool_name, c, f, d)),'[]') FROM (SELECT tool_name, count(*) AS c, sum(status<>'completed') AS f, CAST(round(avg(duration_ms)) AS int) AS d FROM tool_usage $scope GROUP BY tool_name ORDER BY c DESC LIMIT 8)),
         'todos',(SELECT json_array(sum(CASE WHEN status='completed' THEN 1 ELSE 0 END), count(*)) FROM todo),
         'stability',(SELECT json_array(COALESCE(sum(retry_count),0), COALESCE(sum(cancelled_by_user),0), COALESCE(sum(CASE WHEN status='error' THEN 1 ELSE 0 END),0)) FROM U),
         'hours',(SELECT COALESCE(json_group_object(hr, c),'{}') FROM (SELECT strftime('%H', started_at/1000,'unixepoch','localtime') AS hr, count(*) AS c FROM U GROUP BY hr)),
-        'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+        'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts), json(c.triggers))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts, json_group_array(COALESCE(json_extract(p.data,'$.trigger'),'manual') || '/' || COALESCE(json_extract(p.data,'$.phase'),'')) AS triggers FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+        'ctxMix',(SELECT COALESCE(json_group_array(json_array(SI.i, m.t, m.b)),'[]') FROM (SELECT p.session_id AS sid, json_extract(p.data,'$.type') AS t, sum(length(p.data)) AS b FROM part p WHERE p.session_id IN (SELECT DISTINCT session_id FROM R) AND p.session_id IS NOT NULL GROUP BY p.session_id, json_extract(p.data,'$.type')) m LEFT JOIN S SI ON SI.v = m.sid WHERE SI.i IS NOT NULL),
+        'sessionAgents',(SELECT COALESCE(json_group_array(json_array(SI.i, a.agent, a.c, a.tok)),'[]') FROM (SELECT COALESCE(${parent_expr}, mu.session_id) AS root_sid, COALESCE(NULLIF(${agent_expr},''),'-') AS agent, count(*) AS c, sum(mu.input_tokens+mu.output_tokens+mu.reasoning_tokens) AS tok FROM R mu LEFT JOIN session ch ON ch.id = mu.session_id WHERE mu.query_source='subagent' GROUP BY 1, 2) a LEFT JOIN S SI ON SI.v = a.root_sid WHERE SI.i IS NOT NULL),
         'sessionTools',(SELECT COALESCE(json_group_array(json_array(SI.i, t.tool, t.c, t.ms)),'[]') FROM (SELECT session_id AS sid, tool_name AS tool, count(*) AS c, CAST(sum(duration_ms) AS int) AS ms FROM tool_usage GROUP BY session_id, tool_name) t LEFT JOIN S SI ON SI.v = t.sid WHERE SI.i IS NOT NULL),
         'disk', json('{"logs":$logs_mb,"rollout":$rollout_mb,"artifacts":$artifacts_mb,"db":$db_mb}'),
         'providerNames', json_extract(json('$PMETA'),'$.providerNames'),
@@ -96,6 +110,7 @@ cmd_dashboard() {
         'budgetDaily', $BUDGET_D,
         'budgetMonthly', $BUDGET_M,
         'zcodeLocale', '$ZLOC',
+        'userLang', '$ULANG',
         'prices',(SELECT CASE
               WHEN pj IS NULL OR NOT json_valid(pj) THEN json('{}')
               ELSE json_object('currency', COALESCE(json_extract(pj,'$.currency'),'CNY'),
@@ -115,7 +130,7 @@ cmd_dashboard() {
                   R.duration_ms,
                   CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
                   CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-                  R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turn_expr}))
+                  R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turn_expr}, ${ctx_exc_expr}))
                 FROM R
                 LEFT JOIN S SI ON SI.v = R.session_id
                 LEFT JOIN M MI ON MI.v = R.model_id
@@ -126,6 +141,25 @@ cmd_dashboard() {
       cat <<'UD_HEAD'
 <div id="usage-dashboard">
 <style>
+/* ===== 主题变量回退：生成页 file:// 直开无宿主注入时不再缺色（值与官方主题一致，宿主内同值覆盖无感） ===== */
+#usage-dashboard{
+  --background:#ffffff; --foreground:#1a1a1a; --card:#ffffff;
+  --muted:#f2f2f3; --muted-foreground:#6b6b70; --border:#e4e4e7;
+  --primary:#18181b; --primary-foreground:#ffffff;
+  --blue:#2f6bff; --green:#15803d; --red:#dc2626; --yellow:#b45309;
+  --viz-series-1:#4066f0; --viz-series-2:#e8890c; --viz-series-3:#0f9d6a;
+  --viz-series-4:#ab47bc; --viz-series-5:#d15b5b; --viz-series-6:#2f80c8;
+}
+@media (prefers-color-scheme: dark){
+  #usage-dashboard{
+    --background:#1b1b1f; --foreground:#e9e9ec; --card:#232328;
+    --muted:#2c2c31; --muted-foreground:#9c9ca6; --border:#3a3a41;
+    --primary:#e9e9ec; --primary-foreground:#1b1b1f;
+    --blue:#5b8cff; --green:#3fbf7f; --red:#f47166; --yellow:#d9a514;
+    --viz-series-1:#6c8cff; --viz-series-2:#e8a15c; --viz-series-3:#5cbf9a;
+    --viz-series-4:#c586c0; --viz-series-5:#d16f6f; --viz-series-6:#7fb3e0;
+  }
+}
 /* ===== token 层：宿主变量之上派生，统一节奏（轻分隔、紧凑行、克制的色彩） ===== */
 #usage-dashboard{
   --ud-soft:color-mix(in srgb,var(--border) 55%,transparent);
@@ -178,12 +212,49 @@ cmd_dashboard() {
 #usage-dashboard .ud-budget-bar{flex:0 0 110px;height:5px;border-radius:3px;background:var(--muted);overflow:hidden;}
 #usage-dashboard .ud-budget-bar>i{display:block;height:100%;background:var(--ud-accent);border-radius:3px;}
 #usage-dashboard .ud-budget-bar.ud-over>i{background:var(--red,var(--viz-series-1));}
+#usage-dashboard .ud-budget-bar.ud-warn>i{background:var(--yellow,var(--viz-series-2));}
 /* ===== 图例（构成/趋势） ===== */
 #usage-dashboard .ud-legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:6px 0;}
 #usage-dashboard .ud-legend .form-check{display:inline-flex;align-items:center;gap:4px;margin:0;}
-#usage-dashboard .ud-leg{display:flex;flex-direction:column;gap:4px;min-width:0;}
-#usage-dashboard .ud-leg-row{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;line-height:1.5;padding:1px 4px;margin:0 -4px;border-radius:5px;}
+#usage-dashboard .ud-brow-row{display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 6px;border-radius:6px;cursor:pointer;margin:0 -6px;min-width:0;}
+#usage-dashboard .ud-brow-row:hover{background:var(--muted);}
+#usage-dashboard .ud-brow-row .nm{font-weight:500;flex:none;}
+#usage-dashboard .ud-brow-arrow{display:inline-block;transition:transform .15s;color:var(--muted-foreground);width:12px;flex:none;}
+#usage-dashboard .ud-brow-row.ud-open .ud-brow-arrow{transform:rotate(90deg);}
+#usage-dashboard .ud-brow-row .bar{flex:1 1 20px;max-width:72px;height:5px;border-radius:3px;background:var(--muted);overflow:hidden;}
+#usage-dashboard .ud-brow-row .bar i{display:block;height:100%;border-radius:3px;}
+#usage-dashboard .ud-brow-row .abs{font-size:11px;color:var(--muted-foreground);font-variant-numeric:tabular-nums;flex:none;}
+#usage-dashboard .ud-brow-row .n{font-weight:600;font-variant-numeric:tabular-nums;flex:none;min-width:30px;text-align:right;}
+#usage-dashboard .ud-brow-items{margin:2px 0 6px 18px;border-left:2px solid var(--border);padding-left:10px;}
+#usage-dashboard .ud-brow-item{display:flex;gap:10px;font-size:11px;padding:2px 0;align-items:baseline;min-width:0;}
+#usage-dashboard .ud-brow-item .ts{color:var(--muted-foreground);flex:none;font-variant-numeric:tabular-nums;}
+#usage-dashboard .ud-brow-item .sn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;}
+#usage-dashboard .ud-brow-item .sn .full{display:none;}
+#usage-dashboard .ud-brow-item.ud-full .sn{white-space:normal;word-break:break-all;}
+#usage-dashboard .ud-brow-item.ud-full .sn .full{display:inline;}
+#usage-dashboard .ud-brow-item.ud-full .sn{color:var(--foreground);}
+#usage-dashboard .ud-brow-item.ud-full .sn{white-space:normal;word-break:break-word;}
+#usage-dashboard .ud-toolhead{font-weight:600;margin:4px 0 4px;}
+#usage-dashboard .ud-tooljson{background:var(--muted);border-radius:8px;padding:6px 10px;max-height:280px;overflow-y:auto;}
+#usage-dashboard .ud-tooljson .ud-kvrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--ud-soft);align-items:baseline;}
+#usage-dashboard .ud-tooljson .ud-kvrow:last-child{border-bottom:none;}
+#usage-dashboard .ud-tooljson .ud-kvrow .k{flex:none;min-width:90px;max-width:30%;color:var(--muted-foreground);font-family:var(--ud-mono);font-size:11px;word-break:break-all;}
+#usage-dashboard .ud-tooljson .ud-kvrow .v{flex:1;font-family:var(--ud-mono);font-size:11px;white-space:pre-wrap;word-break:break-word;}
+#usage-dashboard .ud-rawbody{font-family:var(--ud-mono);font-size:11px;background:var(--muted);border-radius:8px;padding:6px 10px;white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto;margin:4px 0 0;}
+#usage-dashboard .ud-msgbody{white-space:pre-wrap;word-break:break-word;line-height:1.7;max-height:320px;overflow-y:auto;background:var(--muted);border-radius:8px;padding:8px 12px;margin:4px 0 0;}
+#usage-dashboard .ud-msgbody.ud-reasoning{color:var(--muted-foreground);font-style:italic;}
+#usage-dashboard .ud-brow-item .abs{color:var(--muted-foreground);flex:none;font-variant-numeric:tabular-nums;}
+#usage-dashboard .ud-leg{display:flex;flex-direction:column;gap:3px;min-width:0;}
+#usage-dashboard .ud-leg-row{display:flex;align-items:center;gap:8px;font-size:12px;line-height:1.5;padding:1px 4px;margin:0 -4px;border-radius:5px;min-width:0;}
 #usage-dashboard .ud-leg-row:hover{background:var(--muted);}
+#usage-dashboard .ud-leg-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;}
+#usage-dashboard .ud-leg-row .bar{flex:1 1 20px;max-width:56px;min-width:14px;height:5px;border-radius:3px;background:var(--muted);overflow:hidden;}
+#usage-dashboard .ud-leg-row .bar i{display:block;height:100%;border-radius:3px;}
+#usage-dashboard .ud-leg-row .abs{font-size:11px;color:var(--muted-foreground);font-variant-numeric:tabular-nums;flex:none;}
+#usage-dashboard .ud-leg-row .n{font-weight:600;font-variant-numeric:tabular-nums;flex:none;min-width:30px;text-align:right;}
+#usage-dashboard .ud-pill{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--muted);font-size:11px;color:var(--muted-foreground);margin:0 6px 4px 0;white-space:nowrap;}
+#usage-dashboard .ud-hero-num{font-size:26px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;}
+#usage-dashboard .ud-hero-pct{font-size:22px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;}
 #usage-dashboard .ud-leg-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 #usage-dashboard .ud-leg-row .n{flex:0 0 auto;color:var(--muted-foreground);font-variant-numeric:tabular-nums;}
 #usage-dashboard .ud-stack{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--muted);margin:8px 0 4px;gap:1px;}
@@ -248,7 +319,8 @@ cmd_dashboard() {
 #usage-dashboard .ud-tl-dot.ud-tl-more{background:var(--muted-foreground);}
 #usage-dashboard .ud-tl-t{font-variant-numeric:tabular-nums;color:var(--muted-foreground);flex:0 0 auto;}
 #usage-dashboard .ud-tl-x{color:var(--foreground);}
-#usage-dashboard .ud-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 16px;margin:4px 0;}
+#usage-dashboard .ud-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:4px 0;}
+#usage-dashboard .ud-kv>div{background:var(--muted);border-radius:10px;padding:7px 10px;}
 #usage-dashboard .ud-kv-l{font-size:11px;color:var(--muted-foreground);}
 #usage-dashboard .ud-kv-v{font-size:13px;font-weight:500;}
 #usage-dashboard .ud-sec{margin-top:14px;}
@@ -335,6 +407,7 @@ UD_HEAD
     <div><div class="v tabular-nums" id="ud-k3">–</div><div class="l">生成 token</div><div class="s" id="ud-k3c"></div></div>
     <div><div class="v tabular-nums" id="ud-k4">–</div><div class="l">活跃会话</div><div class="s" id="ud-k4c"></div></div>
   </div>
+  <div class="ud-sec" id="ud-budget-hero" hidden></div>
   <div class="ud-sec"><div class="ud-kv-l">用量洞察</div><div class="ud-facts" id="ud-insights" aria-live="polite"></div><div class="ud-more" id="ud-insights-more" hidden></div></div>
   <div class="ud-sec"><div class="ud-kv-l">性能体检</div><div class="ud-facts" id="ud-health"></div></div>
   <div id="ud-quota-card" hidden></div>
@@ -583,6 +656,39 @@ var I18N_EN = {
   '预付额度使用情况': "Prepaid credit usage",
   'Token Plan 窗口用量': "Token Plan window usage",
   '重新打开面板后生效': "Reopen the panel to apply",
+  '已保存，重新打开面板后生效': "Saved. Reopen the panel to apply",
+  '上下文 Top →': 'Context Top →',
+  '加载中…': "Loading…",
+  '子代理并行时间轴': 'Subagent parallel timeline',
+  '上下文浏览器': 'Context Browser',
+  ' 条': ' items',
+  '仅展示最大的前 30 条': 'showing the largest 30 items only',
+  '近 1h': 'last 1h',
+  '水位': 'Level',
+  '增量': 'Delta',
+  '点击展开/收起全文': 'click to expand/collapse full text',
+  '点击看该子代理请求': 'click to view its requests',
+  '耗时构成': 'Timing Breakdown',
+  '首字等待': 'TTFT wait',
+  '生成': 'Generation',
+  '工具执行': 'Tool runs',
+  '活跃时长': 'Active time',
+  '本月 ': 'This month ',
+  '燃烧率 ': 'Burn rate ',
+  '达 80% / 100% 时系统提醒': 'system alert at 80% / 100%',
+  '当前上下文': 'Current Context',
+  'of context used': 'of context used',
+  '窗口上限 ': 'window limit ',
+  '缓存率 ': 'cache ',
+  '压缩 ': 'compacted ',
+  ' 次': ' times',
+  '无压缩': 'no compaction',
+  '缓存读': 'cache read',
+  '未命中输入': 'uncached input',
+  '峰值 ': 'peak ',
+  '子代理散点': 'subagent dots',
+  '工具字节 Top（存储字节）': 'Tool bytes top (storage bytes)',
+  '文件字节 Top（Read/Edit/Write）': 'File bytes top (Read/Edit/Write)',
   '保存中…': "Saving…",
   '已保存': "Saved",
   '保存 Key': "Save Keys",
@@ -636,6 +742,23 @@ var I18N_EN = {
   '近 7 天，每天按 0–23 时切分；着色深浅按该小时 token 用量，悬停查看明细。': 'Last 7 days split into 0–23h slots; darker means more tokens in that hour. Hover for details.',
   '每日自动同步模型价': 'Auto-sync model prices daily',
   '共 N 个事件': 'N events in total',
+  '上下文构成': 'Context Composition',
+  '对话文本': 'Conversation text',
+  '思考': 'Reasoning',
+  '工具调用与结果': 'Tool calls & results',
+  '步骤骨架': 'Step skeleton',
+  '附件': 'Attachments',
+  '元数据与其他': 'Metadata & other',
+  '按本地存储字节近似，非模型实际读取的 token 计量': 'Approximated by local storage bytes, not the tokens actually read by the model',
+  '无分段数据': 'No part data',
+  'Agent 团队（子代理分布）': 'Agent team (subagent breakdown)',
+  '未知来源': 'Unknown',
+  '（': ' (',
+  '）': ')',
+  '自动': 'auto',
+  '手动': 'manual',
+  '超出窗口': 'over window',
+  ' · 已超上下文窗口 · 输入 ': ' · over context window · input ',
   '按请求输入 token 近似 · 峰值 ': 'Approx. per-request input tokens · peak ',
   '压缩事件 ': 'Compact event ',
   '压缩事件': 'Compact events',
@@ -664,7 +787,7 @@ var I18N_EN = {
   "月预算 ¥": "Monthly ¥",
   "保存预算": "Save Budget",
   "通知（macOS 系统通知，全部本地计算、零模型开销）": "Notifications (macOS system notifications, all local, zero model cost)",
-  "切换后本地面板立即生效；侧栏面板重新打开后生效": "Applies immediately in the local panel; reopen the side panel to apply",
+  "语言选择保存到本地文件，全面板共享：本地面板与生成页立即生效；侧栏面板重新打开后生效": "Saved to a local file shared by all panels: applies immediately in the local panel and generated pages; reopen the side panel to apply",
   "每轮用量统计": "Per-turn Usage Stats",
   "每轮回合结束弹通知显示本轮速率 / 缓存率 / 耗时（不进入对话上下文）。选「关」时统计仍显示在侧栏面板顶部横幅": "A notification with rate / cache / duration pops when each turn ends (never sent to the model). When off, stats still show in the side panel top banner",
   "关": "Off",
@@ -729,8 +852,15 @@ try {
   // 语言判定：手动选择(localStorage) > 侧栏/本地跟随 ZCode 界面语言(localePreference) > 浏览器/WebView 语言
   // serve 浏览器模式恒跟随浏览器（独立服务的访客以浏览器语言为准）；localePreference=system 留空同回退
   I18N_LANG = (function () {
-    var pref = localStorage.getItem('ud-lang');
-    if (pref) return pref;
+    // 判定链：本 origin 显式选择(localStorage) > 跨面板权威文件(userLang，随 DATA 注入)
+    // > ZCode 界面语言(localePreference，serve 浏览器模式跳过) > 浏览器/WebView 语言
+    var pref = '';
+    try { pref = String(localStorage.getItem('ud-lang') || ''); } catch (e) {}
+    if (pref === 'zh' || pref === 'en') return pref;
+    var ul = '';
+    // __USAGE_LANG__：serve 初始页服务端同步注入（判定时 /api/data 尚未返回）；其余模式读 DATA.userLang
+    try { ul = String(window.__USAGE_LANG__ || (typeof DATA === 'object' && DATA && DATA.userLang) || ''); } catch (e) {}
+    if (ul === 'zh' || ul === 'en') return ul;
     var zl = '';
     try { zl = String((typeof DATA === 'object' && DATA && DATA.zcodeLocale) || ''); } catch (e) {}
     var zc = zl ? (zl.toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en') : '';
@@ -784,6 +914,8 @@ function __usageBoot(D) {
   var PVNAME = D.providerNames || {}; // BYOK 真名映射（id → 显示名），pvLabel 与文本筛选共用
   var PVNAME_PV = PV.map(function (id) { return PVNAME[id] || id; });
   var TOOLS = D.tools || [], SD = D.sessionDirs || [];
+  var CTXMIX = D.ctxMix || [];   // 上下文构成（按 part 存储字节近似）：[session索引, part类型, 字节]
+  var SAGENTS = D.sessionAgents || []; // 子代理具名分布：[session索引, agent, 请求数, token]
   var PRICE = (D.prices && typeof D.prices === 'object') ? D.prices : null;
   var PMODELS = PRICE && PRICE.models && typeof PRICE.models === 'object' ? PRICE.models : PRICE;
   var CURSYM = (function () {
@@ -856,7 +988,9 @@ function __usageBoot(D) {
       } else {
         paths += '<path d="M' + x0.toFixed(1) + ' ' + y0.toFixed(1) + ' A' + R1 + ' ' + R1 + ' 0 ' + large + ' 1 ' + x1.toFixed(1) + ' ' + y1.toFixed(1) + ' L' + xi.toFixed(1) + ' ' + yi.toFixed(1) + ' A' + R0 + ' ' + R0 + ' 0 ' + large + ' 0 ' + xj.toFixed(1) + ' ' + yj.toFixed(1) + ' Z" fill="' + color + '" fill-opacity="0.88"><title>' + esc(tipTxt) + '</title></path>';
       }
-      legend += '<div class="ud-leg-row"><span class="nm" title="' + esc(it.name) + '"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + color + ';margin-right:5px"></i>' + esc(it.name) + '</span><span class="n">' + Math.round(frac * 100) + '%</span></div>';
+      legend += '<div class="ud-leg-row"><span class="nm" title="' + esc(it.name) + '"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + color + ';margin-right:5px"></i>' + esc(it.name) + '</span><span class="bar"><i style="width:' + Math.round(frac * 100) + '%;background:' + color + '"></i></span>' +
+        (it.absLabel ? '<span class="abs">' + esc(it.absLabel) + '</span>' : '') +
+        '<span class="n">' + Math.round(frac * 100) + '%</span></div>';
       a0 = a1;
     });
     return '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
@@ -976,6 +1110,7 @@ function __usageBoot(D) {
     return base * tierMult(r[1], p.tariff);
   }
   function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : N(mb) + ' MB'; }
+  function fmtBytes(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : b >= 1024 ? (b / 1024).toFixed(1) + ' KB' : N(b) + ' B'; } // 构成环口径（存储字节）
   // 项目名：取最后一段目录名，兼容 Windows 反斜杠与 POSIX 斜杠（尾分隔符、盘符根都安全）
   function baseName(dir) {
     var parts = String(dir || '').split(/[\\/]+/).filter(Boolean);
@@ -1007,7 +1142,7 @@ function __usageBoot(D) {
   var maxTs = 0;
   R.forEach(function (r) { if (r[1] > maxTs) maxTs = r[1]; });
   var cmpMap = {}, toolsMap = {};
-  (D.compactions || []).forEach(function (c) { cmpMap[c[0]] = { cnt: c[1], pre: c[2], ts: c[3] || [] }; });
+  (D.compactions || []).forEach(function (c) { cmpMap[c[0]] = { cnt: c[1], pre: c[2], ts: c[3] || [], trg: c[4] || [] }; });
   (D.sessionTools || []).forEach(function (t) { (toolsMap[t[0]] || (toolsMap[t[0]] = [])).push([t[1], t[2], t[3]]); });
 
   var st = { p: -1, m: -1, s: -1, rng: 'today', day: null, proj: null, q: '', hidePv: {} };
@@ -1189,6 +1324,29 @@ function __usageBoot(D) {
       var color = pct >= 100 ? 'red' : pct >= 80 ? 'gold' : 'green';
       var sub = N(D.budgetMonthly) > 0 ? tr('月预算 ') + CURSYM + N(D.budgetMonthly).toFixed(0) : tr('达 80% / 100% 时系统提醒');
       items.push(row(tr('今日预算'), CURSYM + (c >= 100 ? Math.round(c) : c.toFixed(2)) + ' / ' + CURSYM + bd.toFixed(0) + ' · ' + pct + '%', color, sub));
+      // 预算 hero 卡（对标 Current Context 层级）：今日成本大数字 / 日预算 + 进度条 + 月/燃烧率 pill
+      var heroEl = $('ud-budget-hero');
+      if (heroEl) {
+        var bm = N(D.budgetMonthly);
+        var monthCost = 0, m0 = new Date(); m0.setDate(1); m0 = new Date(m0.toDateString()).getTime();
+        R.forEach(function (r) { if (r[1] >= m0) { var x = rowCost(r); if (x != null) monthCost += x; } });
+        var r1h = 0, nowMs = Date.now();
+        R.forEach(function (r) { if (r[1] >= nowMs - 3600e3 && r[1] <= nowMs + 60e3) r1h += N(r[4]) + N(r[5]); });
+        var barColor = pct >= 100 ? 'var(--red)' : pct >= 80 ? 'var(--yellow)' : 'var(--green)';
+        heroEl.innerHTML =
+          '<div class="ud-kv-l">' + tr('今日预算') + '</div>' +
+          '<div style="display:flex;align-items:baseline;gap:8px;margin:2px 0 6px;flex-wrap:wrap">' +
+          '<span class="ud-hero-num">' + CURSYM + (c >= 100 ? Math.round(c) : c.toFixed(2)) + '</span>' +
+          '<span class="text-muted text-small">/ ' + CURSYM + bd.toFixed(0) + '</span>' +
+          '<span class="ud-hero-pct" style="margin-left:auto;color:' + barColor + '">' + pct + '%</span></div>' +
+          '<div style="height:10px;border-radius:5px;background:var(--muted);overflow:hidden;margin:0 0 8px"><div style="width:' + Math.min(100, pct) + '%;height:100%;background:' + barColor + '"></div></div>' +
+          '<div>' +
+          (bm > 0 ? '<span class="ud-pill">' + tr('本月 ') + CURSYM + monthCost.toFixed(2) + ' / ' + CURSYM + bm.toFixed(0) + '</span>' : '') +
+          (r1h > 0 ? '<span class="ud-pill">' + tr('燃烧率 ') + fmtI(Math.round(r1h / 60)) + ' tok/min</span>' : '') +
+          '<span class="ud-pill">' + tr('达 80% / 100% 时系统提醒') + '</span>' +
+          '</div>';
+        heroEl.hidden = false;
+      }
     })();
     items.push(row(tr('活跃天数'), days.length + tr(' 天'), 'blue'));
     items.push(row(tr('连续活跃'), cur + tr(' 天'), 'blue', tr('最长 ') + longest));
@@ -1612,7 +1770,7 @@ function __usageBoot(D) {
       pv2[r[3]] = (pv2[r[3]] || 0) + 1;
     });
     var mix = donut(Object.keys(mm).sort(function (a, b) { return mm[b] - mm[a]; }).map(function (k) {
-      return { name: k, value: mm[k], tip: k + ' · ' + fmt(mm[k]) + ' tok (' + Math.round(mm[k] / (mtot() || 1) * 100) + '%)' };
+      return { name: k, value: mm[k], absLabel: '≈' + fmt(mm[k]), tip: k + ' · ' + fmt(mm[k]) + ' tok (' + Math.round(mm[k] / (mtot() || 1) * 100) + '%)' };
     }), 'token');
     function mtot() { var t = 0; for (var k2 in mm) t += mm[k2]; return t; }
     var pvm = Object.keys(pv2).map(function (k) { return '<span class="text-small text-muted">' + pvLabel(k) + ' ×' + pv2[k] + '</span>'; }).join(' · ');
@@ -1622,7 +1780,10 @@ function __usageBoot(D) {
     var cmpHtml = cm ? tr('压缩 ') + cm.cnt + tr(' 次 · 压缩前水位最高 ') + fmt(cm.pre) + ' token' : tr('无压缩记录');
     // 事件时间线：压缩事件（META 带时间）+ 模型切换（相邻请求模型变化推导），按时间归并
     var events = [];
-    (cm ? cm.ts : []).forEach(function (t) { events.push({ t: t, label: tr('上下文压缩') }); });
+    (cm ? cm.ts : []).forEach(function (t, i) {
+      var trig = cm.trg && cm.trg[i] ? String(cm.trg[i]).replace(/^auto\//, tr('自动') + '/').replace(/^manual\//, tr('手动') + '/').replace(/\/$/, '') : '';
+      events.push({ t: t, label: tr('上下文压缩') + (trig ? tr('（') + trig + tr('）') : ''), cls: 'ud-tl-c' });
+    });
     var prevM = -1;
     rs.forEach(function (r) {
       if (prevM !== -1 && r[2] !== prevM) {
@@ -1635,7 +1796,7 @@ function __usageBoot(D) {
     var tl8 = events.length
       ? '<div class="ud-sec"><div class="ud-kv-l">' + tr('事件时间线') + '</div><div class="ud-timeline">' +
         events.slice(-12).map(function (e) {
-          var cls = e.label.indexOf(tr('压缩')) >= 0 ? 'ud-tl-c' : 'ud-tl-m';
+          var cls = e.cls || (e.label.indexOf(tr('压缩')) >= 0 ? 'ud-tl-c' : 'ud-tl-m');
           return '<div class="ud-tl-item"><span class="ud-tl-dot ' + cls + '"></span><span class="ud-tl-t">' + esc(e.t) + '</span><span class="ud-tl-x">' + esc(e.label) + '</span></div>';
         }).join('') +
         (events.length > 12 ? '<div class="ud-tl-item"><span class="ud-tl-dot ud-tl-more"></span><span class="ud-tl-t">…</span><span class="ud-tl-x text-muted">' + tr('共 N 个事件').replace('N', events.length) + '</span></div>' : '') +
@@ -1682,9 +1843,11 @@ function __usageBoot(D) {
       var tt = pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
       var st = r[8] === 0 ? tr('完成') : r[8] === 1 ? tr('失败') : r[8] === 2 ? tr('已取消') : tr('进行中');
       var tip = '<title>' + esc(tt) + tr(' · 输入 ') + fmt(N(r[4])) + tr(' tok · 生成 ') + fmt(N(r[5])) + ' tok · ' + esc(MD[r[2]] || '?') + ' · ' + st + turnLabel + (r[9] === 1 ? tr(' · 子代理') : '') + '</title>';
-      if (r[9] === 1) { subDots.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (rs.length > 60 ? 2.2 : 3.2) + '" fill="var(--viz-series-2)" fill-opacity="0.9">' + tip + '</circle>'); return; }
+      var over = r[15] === 1 || r[15] === true;
+      if (over) tip = '<title>' + esc(tt) + tr(' · 已超上下文窗口 · 输入 ') + fmt(N(r[4])) + ' tok · ' + esc(MD[r[2]] || '?') + ' · ' + st + turnLabel + '</title>';
+      if (r[9] === 1) { subDots.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (rs.length > 60 ? 2.2 : 3.2) + '" fill="' + (over ? 'var(--red)' : 'var(--viz-series-2)') + '" fill-opacity="0.9">' + tip + '</circle>'); return; }
       pts.push(x.toFixed(1) + ',' + y.toFixed(1));
-      dots.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (rs.length > 60 ? 2.4 : 3.4) + '" fill="var(--viz-series-1)" fill-opacity="0.85">' + tip + '</circle>');
+      dots.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (rs.length > 60 ? 2.4 : 3.4) + '" fill="' + (over ? 'var(--red)' : 'var(--viz-series-1)') + '" fill-opacity="0.85">' + tip + '</circle>');
     });
     // 压缩事件：按时间对齐到最近的请求位置，虚线竖线标注
     var cmpMarks = '';
@@ -1711,23 +1874,147 @@ function __usageBoot(D) {
       areaPath + turnSeps.join('') + limitLine + cmpMarks +
       (pts.length > 1 ? '<polyline points="' + pts.join(' ') + '" fill="none" stroke="var(--viz-series-1)" stroke-width="1.5"/>' : '') +
       dots.join('') + subDots.join('') + '</svg>';
+    // 逐请求增量视图（对标 Delta 模式）：主会话相邻请求输入差值，正蓝负绿，压缩处可见净删
+    var deltaSvg = (function () {
+      var seq = [];
+      rs.forEach(function (r) { if (r[9] !== 1) seq.push({ t: r[1], v: N(r[4]) }); });
+      if (seq.length < 2 || seq.length > 2000) return ''; // 超大序列不构建增量视图（避免双倍 SVG DOM）
+      var ds = seq.map(function (x, i) { return { t: x.t, d: i ? x.v - seq[i - 1].v : x.v }; });
+      var maxAbs = 1;
+      ds.forEach(function (x) { if (Math.abs(x.d) > maxAbs) maxAbs = Math.abs(x.d); });
+      var y0 = H / 2, bw = Math.max(1.5, (W - 8) / ds.length - 1);
+      var bars = ds.map(function (x, i) {
+        var h = Math.abs(x.d) / maxAbs * (H / 2 - 10);
+        var x0 = ds.length > 1 ? i / (ds.length - 1) * (W - 8) + 4 : W / 2;
+        var up = x.d >= 0;
+        var d = new Date(x.t);
+        var tip = '<title>' + esc(pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes())) + ' · ' + (up ? '+' : '−') + fmt(Math.abs(x.d)) + ' tok</title>';
+        return '<rect x="' + (x0 - bw / 2).toFixed(1) + '" y="' + (up ? (y0 - h) : y0).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.max(1, h).toFixed(1) + '" fill="' + (up ? 'var(--viz-series-1)' : 'var(--viz-series-3)') + '" fill-opacity="0.85">' + tip + '</rect>';
+      }).join('');
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" role="img" aria-label="逐请求增量">' +
+        '<line x1="0" x2="' + W + '" y1="' + y0 + '" y2="' + y0 + '" stroke="var(--border)" stroke-width="1"/>' + bars + '</svg>';
+    })();
     var startT = fullTs(rs.length ? rs[0][1] : 0), endT = fullTs(o.last);
     // 起止时间直接标在水位曲线两端上方
     var curveWrap = '<div style="position:relative">' +
       '<span class="text-small text-muted" style="position:absolute;left:0;top:0">' + esc(startT) + '</span>' +
       '<span class="text-small text-muted" style="position:absolute;right:0;top:0;text-align:right">' + esc(endT) + '</span>' +
-      '<div style="padding-top:16px">' + curve + '</div></div>';
+      '<div style="padding-top:16px"><div id="ud-curve-level">' + curve + '</div>' +
+      (deltaSvg ? '<div id="ud-curve-delta" hidden>' + deltaSvg + '</div>' : '') + '</div></div>';
     var hasSub = subReq > 0;
-    var curveHead = '<div class="ud-kv-l" style="margin:2px 0 2px">' + tr('按请求输入 token 近似 · 峰值 ') + fmt(maxIn) +
-      (ctxLimit ? tr(' · 占 ') + esc(MD[domModel]) + tr(' 窗口 ') + Math.round(maxIn / ctxLimit * 100) + tr('%（上限 ') + fmt(ctxLimit) + '）' : '') +
-      tr(' · 悬停看点明细') + (hasSub ? ' · <span style="color:var(--viz-series-2)">●</span> 子代理为独立上下文（散点）' : '') +
-      (cm ? ' · <span style="color:var(--yellow)">┆</span> ' + tr('压缩事件') : '') + '</div>';
+    var hasOver = rs.some(function (r) { return r[15] === 1 || r[15] === true; });
+    var curveHead = '<div class="ud-kv-l" style="margin:2px 0 2px">' +
+      '<span class="ud-pill">' + tr('峰值 ') + fmt(maxIn) + ' tok</span>' +
+      (ctxLimit ? '<span class="ud-pill">' + esc(MD[domModel]) + ' ' + Math.round(maxIn / ctxLimit * 100) + '%</span>' : '') +
+      (hasSub ? '<span class="ud-pill"><span style="color:var(--viz-series-2)">●</span> ' + tr('子代理散点') + '</span>' : '') +
+      (cm ? '<span class="ud-pill"><span style="color:var(--yellow)">┆</span> ' + tr('压缩事件') + '</span>' : '') +
+      (hasOver ? '<span class="ud-pill" style="color:var(--red)">● ' + tr('超出窗口') + '</span>' : '') +
+      (deltaSvg ? '<span class="viz-row" style="margin:0 6px;vertical-align:middle"><button type="button" class="ud-toggle" data-cmode="level" aria-pressed="true">' + tr('水位') + '</button><button type="button" class="ud-toggle" data-cmode="delta" aria-pressed="false">' + tr('增量') + '</button></span>' : '') +
+      '<span class="text-muted">' + tr('悬停看点明细') + '</span></div>';
     var toolDonut = (toolsMap[o.g] || []).length
       ? donut((toolsMap[o.g] || []).slice().sort(function (a, b) { return b[1] - a[1]; }).slice(0, 6).map(function (t) {
-          return { name: String(t[0]).replace(/^mcp__/, ''), value: t[1], tip: String(t[0]).replace(/^mcp__/, '') + ' · ' + fmtI(t[1]) + tr(' 次调用') + (t[3] ? tr(' · 累计 ') + fmtI(t[3]) + ' ms' : '') };
+          return { name: String(t[0]).replace(/^mcp__/, ''), value: t[1], absLabel: fmtI(t[1]) + tr(' 次'), tip: String(t[0]).replace(/^mcp__/, '') + ' · ' + fmtI(t[1]) + tr(' 次调用') + (t[3] ? tr(' · 累计 ') + fmtI(t[3]) + ' ms' : '') };
         }), tr('调用'))
       : '<span class="text-muted text-small">无工具调用</span>';
     function kv(l, v) { return '<div><div class="ud-kv-l">' + l + '</div><div class="ud-kv-v">' + v + '</div></div>'; }
+    // 上下文构成环：按 part 存储字节近似（text/reasoning/tool/step/file/其他 → 五类），口径非 token
+    var mixItems = (function () {
+      var agg = {};
+      (CTXMIX.filter(function (x) { return x[0] === o.g; })).forEach(function (x) {
+        var t = String(x[1] || 'other');
+        var cat = t === 'text' ? 'text' : t === 'reasoning' ? 'reasoning' : t === 'tool' ? 'tool'
+          : (t === 'step-start' || t === 'step-finish') ? 'step' : t === 'file' ? 'file' : 'meta';
+        agg[cat] = (agg[cat] || 0) + N(x[2]);
+      });
+      var spec = [
+        ['text', tr('对话文本'), 'var(--viz-series-1)'],
+        ['reasoning', tr('思考'), 'var(--viz-series-2)'],
+        ['tool', tr('工具调用与结果'), 'var(--viz-series-3)'],
+        ['step', tr('步骤骨架'), 'var(--viz-series-6)'],
+        ['file', tr('附件'), 'var(--viz-series-4)'],
+        ['meta', tr('元数据与其他'), 'var(--viz-series-5)']
+      ];
+      var out = [], tot = 0;
+      spec.forEach(function (sp) { if (agg[sp[0]] > 0) { tot += agg[sp[0]]; } });
+      if (!tot) return null;
+      spec.forEach(function (sp) {
+        if (agg[sp[0]] > 0) out.push({ name: sp[1], value: agg[sp[0]], color: sp[2], tip: sp[1] + ' · ' + fmtBytes(agg[sp[0]]) + ' (' + Math.round(agg[sp[0]] / tot * 100) + '%)' });
+      });
+      return out;
+    })();
+    var mixRing = mixItems ? donut(mixItems, tr('上下文构成')) : '<span class="text-muted text-small">' + tr('无分段数据') + '</span>';
+    // 上下文 Top 下钻：按需拉取（serve 走 /api/ctx，侧栏走 usage_ctx_top 工具）；生成页无服务不显示
+    var SID = (typeof D === 'object' && D && D.sessionIds) ? D.sessionIds : [];
+    var canCtxTop = !!(window.__USAGE_SERVE__ || (window.zcode && typeof window.zcode.callTool === 'function'));
+    var ctxTopBtn = (mixItems && canCtxTop && SID[o.g])
+      ? '<button type="button" class="btn ud-ctx-top" data-sid="' + esc(String(SID[o.g])) + '" data-sg="' + o.g + '" style="margin:6px 0 0;padding:2px 10px;font-size:12px">' + tr('上下文 Top →') + '</button>'
+      : '';
+    // 上下文 Top 展开输出区（全宽：Fleet 时间轴 + 两榜），挂在详情底部
+    var ctxTopOut = ctxTopBtn ? '<div class="ud-ctx-top-out"></div>' : '';
+    // 当前上下文水位卡（hero）：最后一条请求的输入为「当前水位」，分段=缓存读/未命中输入，余量按窗口上限
+    var hero = (function () {
+      var cur = null;
+      rs.forEach(function (r) { if (!cur || r[1] >= cur[1]) cur = r; });
+      if (!cur) return '';
+      var cin = N(cur[4]), cch = Math.min(N(cur[6]), cin), cmiss = Math.max(0, cin - cch);
+      var d = new Date(cur[1]);
+      var pct = ctxLimit ? Math.round(cin / ctxLimit * 100) : null;
+      var base = ctxLimit ? Math.max(ctxLimit, cin) : cin;
+      var segs = cin > 0
+        ? (cch > 0 ? '<div title="' + tr('缓存读') + ' ' + fmt(cch) + ' tok" style="width:' + (cch / base * 100) + '%;background:var(--viz-series-1)"></div>' : '') +
+          (cmiss > 0 ? '<div title="' + tr('未命中输入') + ' ' + fmt(cmiss) + ' tok" style="width:' + (cmiss / base * 100) + '%;background:var(--viz-series-4)"></div>' : '') +
+          (ctxLimit && ctxLimit > cin ? '<div style="width:' + ((ctxLimit - cin) / base * 100) + '%;background:var(--muted)"></div>' : '')
+        : '';
+      var st = cur[8] === 0 ? tr('完成') : cur[8] === 1 ? tr('失败') : cur[8] === 2 ? tr('已取消') : tr('进行中');
+      return '<div class="ud-sec" style="margin-top:14px"><div class="ud-kv-l">' + tr('当前上下文') +
+        '<span class="text-muted" style="margin-left:8px;font-weight:400">' + esc(MD[cur[2]] || '?') + ' · ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ' · ' + st + (cur[9] === 1 ? ' · ' + tr('子代理') : '') + '</span></div>' +
+        '<div style="display:flex;align-items:baseline;gap:8px;margin:2px 0 6px;flex-wrap:wrap">' +
+        '<span class="ud-hero-num">' + fmt(cin) + '</span><span class="text-muted text-small">' + (ctxLimit ? '/ ' + fmt(ctxLimit) + ' tok' : 'tok') + '</span>' +
+        (pct != null ? '<span style="margin-left:auto" class="ud-hero-pct">' + Math.min(pct, 999) + '%</span><span class="text-muted text-small">' + tr('of context used') + '</span>' : '') +
+        '</div>' +
+        (segs ? '<div style="display:flex;height:10px;border-radius:5px;overflow:hidden;margin:0 0 8px">' + segs + '</div>' : '') +
+        '<div>' +
+        (ctxLimit ? '<span class="ud-pill">' + tr('窗口上限 ') + fmt(ctxLimit) + ' tok</span>' : '') +
+        (cm ? '<span class="ud-pill" style="color:var(--yellow)">' + tr('压缩 ') + cm.cnt + tr(' 次') + '</span>' : '<span class="ud-pill">' + tr('无压缩') + '</span>') +
+        '<span class="ud-pill">' + tr('缓存率 ') + o.rate + '%</span>' +
+        (cur[15] === 1 || cur[15] === true ? '<span class="ud-pill" style="color:var(--red)">' + tr('超出窗口') + '</span>' : '') +
+        '</div></div>';
+    })();
+    var mixNote = mixItems ? '<div class="text-small text-muted" style="margin-top:4px">' + tr('按本地存储字节近似，非模型实际读取的 token 计量') + '</div>' : '';
+    // Agent 团队：该会话子代理具名分布（strip zcode- 前缀；'-' 为未知来源）
+    var sagRows = SAGENTS.filter(function (x) { return x[0] === o.g && N(x[2]) > 0; })
+      .sort(function (a, b) { return N(b[3]) - N(a[3]); });
+    var sagHtml = sagRows.length
+      ? sagRows.map(function (x) {
+          var nm = String(x[1]) === '-' ? tr('未知来源') : String(x[1]).replace(/^zcode-/, '');
+          return '<div class="ud-kv"><div style="display:flex;justify-content:space-between;gap:8px;max-width:460px">' +
+            '<span title="' + esc(String(x[1])) + '">' + esc(nm) + '</span>' +
+            '<span class="text-muted text-small tabular-nums">' + fmtI(N(x[2])) + tr(' 次 · ') + fmt(N(x[3])) + ' tok</span></div></div>';
+        }).join('')
+      : '';
+    // 耗时构成环（对标 Timing Stats）：首字等待 / 生成 / 工具执行三类，中心为总活跃时长
+    var timingRing = (function () {
+      var ttftMs = 0, genMs = 0, tt = 0;
+      rs.forEach(function (r) { var t = N(r[11]); if (t > 0) ttftMs += t; var d = N(r[7]) - t; if (d > 0) genMs += d; });
+      (toolsMap[o.g] || []).forEach(function (t) { tt += N(t[3]); });
+      var parts = [
+        [tr('首字等待'), ttftMs, 'var(--viz-series-2)'],
+        [tr('生成'), genMs, 'var(--viz-series-1)'],
+        [tr('工具执行'), tt, 'var(--viz-series-3)']
+      ].filter(function (x) { return x[1] > 0; });
+      if (!parts.length) return '';
+      var tot4 = parts.reduce(function (a, x) { return a + x[1]; }, 0);
+      return donut(parts.map(function (x) {
+        return { name: x[0], value: x[1], color: x[2], absLabel: fmtDur(x[1]), tip: x[0] + ' · ' + fmtDur(x[1]) + ' (' + Math.round(x[1] / tot4 * 100) + '%)' };
+      }), tr('活跃时长'));
+    })();
+    var ctxRow = (mixItems || sagRows.length || timingRing)
+      ? '<div class="ud-grid3" style="margin-top:14px">' +
+        (mixItems ? '<div><div class="ud-kv-l">' + tr('上下文构成') + '</div>' + mixRing + mixNote + ctxTopBtn + '</div>' : '<div></div>') +
+        (timingRing ? '<div><div class="ud-kv-l">' + tr('耗时构成') + '</div>' + timingRing + '</div>' : '<div></div>') +
+        (sagRows.length ? '<div><div class="ud-kv-l">' + tr('Agent 团队（子代理分布）') + '</div>' + sagHtml + '</div>' : '') +
+        '</div>'
+      : '';
     // 主/子代理 token 拆分条（双色堆叠，悬停看明细；rows r[9]：0 主会话 1 子代理）
     var tot2 = mainTok + subTok;
     var subBar = tot2 > 0
@@ -1738,7 +2025,7 @@ function __usageBoot(D) {
         (mainReq ? '<span style="color:var(--viz-series-1)">■</span> 主会话 ' + fmt(mainTok) + ' tok × ' + fmtI(mainReq) : '') +
         (subReq ? (mainReq ? '　' : '') + '<span style="color:var(--viz-series-3)">■</span> 子代理 ' + fmt(subTok) + ' tok × ' + fmtI(subReq) : '') + '</div>'
       : '';
-    return '<div class="ud-sec"><div class="ud-kv-l">' + tr('项目目录') + '</div><div class="ud-kv-v" style="word-break:break-all">' + dir + '</div>' +
+    return hero + '<div class="ud-sec"><div class="ud-kv-l">' + tr('项目目录') + '</div><div class="ud-kv-v" style="word-break:break-all">' + dir + '</div>' +
       (subReq ? subBar : '') +
       (pvm ? '<div class="text-small text-muted" style="margin-top:4px">' + tr('来源：') + '' + pvm + '</div>' : '') + '</div>' +
       '<div class="ud-kv">' +
@@ -1758,6 +2045,7 @@ function __usageBoot(D) {
       '<div><div class="ud-kv-l">' + tr('使用工具（调用次数占比）') + '</div>' + toolDonut + '</div>' +
       '<div>' + (tl8 || '<div class="ud-kv-l">' + tr('事件时间线') + '</div><span class="text-muted text-small">无压缩 / 模型切换事件</span>') + '</div>' +
       '</div>' +
+      ctxRow + ctxTopOut +
       '<div class="ud-sec" style="margin-top:14px">' + curveHead + curveWrap + '</div>';
   }
   function renderModelBoard(rows) {
@@ -1945,6 +2233,205 @@ function __usageBoot(D) {
         if (!btn) return;
         st.s = +btn.getAttribute('data-sg');
         page = 1; sessExp = -1; detExp = -1;
+        var dbtn = document.querySelector('.nav-pills [role=tab][aria-controls="ud-detail"]');
+        if (dbtn) dbtn.click();
+        apply();
+      });
+      // 上下文 Top 下钻：点击后按需拉取（会话详情是 innerHTML 重渲染，事件挂在表体上）
+      bodyEl.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('.ud-ctx-top') : null;
+        if (!btn) return;
+        var out = btn.closest('.ud-exp').querySelector('.ud-ctx-top-out');
+        if (!out) return;
+        var sid = btn.getAttribute('data-sid');
+        btn.disabled = true; btn.textContent = tr('加载中…');
+        var draw = function (j) {
+          btn.style.display = 'none';
+          var rows2 = function (arr, total, labelFn) {
+            return (arr || []).map(function (x) {
+              var nm = String(x[0] || '');
+              var pct = total > 0 ? Math.round(N(x[2]) / total * 100) : 0;
+              return '<div style="display:flex;justify-content:space-between;gap:8px;max-width:460px" class="text-small">' +
+                '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(nm) + '">' + esc(labelFn(nm)) + '</span>' +
+                '<span class="text-muted tabular-nums" style="flex:none">' + fmtI(N(x[1])) + tr(' 次 · ') + fmtBytes(N(x[2])) + ' · ' + pct + '%</span></div>';
+            }).join('') || '<span class="text-muted text-small">' + tr('暂无数据') + '</span>';
+          };
+          var tt = 0; (j.tools || []).forEach(function (x) { tt += N(x[2]); });
+          var tf = 0; (j.files || []).forEach(function (x) { tf += N(x[2]); });
+          var base = function (p) { return p.replace(/^.*\//, '') || p; };
+          // Fleet 泳道时间轴：每个具名子代理一行，区间条按 [started_at, +duration_ms] 映射到会话时间轴
+          var fleet = j.fleet || [];
+          var gantt = '';
+          if (fleet.length) {
+            var lanes = [];
+            fleet.forEach(function (f) { var a = String(f[0] || '-'); if (lanes.indexOf(a) < 0) lanes.push(a); });
+            var t0 = Infinity, t1 = 0;
+            fleet.forEach(function (f) { var st = N(f[1]), du = Math.max(N(f[2]), 1000); if (st < t0) t0 = st; if (st + du > t1) t1 = st + du; });
+            if (isFinite(t0) && t1 > t0) {
+              var span = t1 - t0, W = 600, laneH = 22, H = lanes.length * laneH + 6;
+              var bars = fleet.map(function (f) {
+                var li = lanes.indexOf(String(f[0] || '-'));
+                var st = N(f[1]), du = Math.max(N(f[2]), 1000);
+                var x = (st - t0) / span * (W - 8) + 4;
+                var w = Math.max(3, du / span * (W - 8));
+                var dt = new Date(st);
+                var tip = esc(String(f[0]).replace(/^zcode-/, '')) + ' · ' + pad(dt.getHours()) + ':' + pad(dt.getMinutes()) + ' · ' + durCell(du) + ' · ' + fmt(N(f[3])) + ' tok';
+                return '<rect class="ud-fleet-bar" data-sid="' + esc(String(f[4] || '')) + '" style="cursor:' + (f[4] ? 'pointer' : 'default') + '" x="' + x.toFixed(1) + '" y="' + (li * laneH + 3) + '" width="' + w.toFixed(1) + '" height="' + (laneH - 8) + '" rx="3" fill="' + PALETTE[li % PALETTE.length] + '" fill-opacity="0.85"><title>' + tip + (f[4] ? ' · ' + tr('点击看该子代理请求') : '') + '</title></rect>';
+              }).join('');
+              var seps = lanes.map(function (_, i) {
+                return '<line x1="0" x2="' + W + '" y1="' + ((i + 1) * laneH + 3) + '" y2="' + ((i + 1) * laneH + 3) + '" stroke="var(--border)" stroke-width="1" opacity="0.45"/>';
+              }).join('');
+              var legend = lanes.map(function (ln, i) {
+                return '<span class="text-small" style="margin-right:14px"><span style="color:' + PALETTE[i % PALETTE.length] + '">■</span> ' + esc(String(ln).replace(/^zcode-/, '')) + '</span>';
+              }).join('');
+              gantt = '<div class="ud-kv-l" style="margin-top:12px">' + tr('子代理并行时间轴') + '</div>' +
+                '<div style="margin:2px 0 2px">' + legend + '</div>' +
+                '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" role="img" aria-label="Fleet">' + seps + bars + '</svg>';
+            }
+          }
+          // 上下文浏览器（对标 dsh Context Browser）：类别行可展开逐条看内容摘要
+          var br = '';
+          (function () {
+            var groups = j.bgroups || [], items = j.bitems || [];
+            if (!groups.length) return;
+            var CAT = {
+              text: [tr('对话文本'), 'var(--viz-series-1)'],
+              reasoning: [tr('思考'), 'var(--viz-series-2)'],
+              tool: [tr('工具调用与结果'), 'var(--viz-series-3)'],
+              file: [tr('附件'), 'var(--viz-series-4)'],
+              compaction: [tr('压缩'), 'var(--viz-series-5)']
+            };
+            var btot = 0;
+            groups.forEach(function (g) { btot += N(g[2]); });
+            var byType = {};
+            items.forEach(function (i) { (byType[i[0]] = byType[i[0]] || []).push(i); });
+            var rowsHtml = '';
+            groups.forEach(function (g) {
+              var t = String(g[0]);
+              var cat = CAT[t] || [t, 'var(--muted-foreground)'];
+              var pct = btot ? Math.round(N(g[2]) / btot * 100) : 0;
+              var r1c = N(g[3]), r1b = N(g[4]);
+              var incBadge = r1c > 0 ? '<span class="ud-pill" style="color:var(--green);flex:none">+' + fmtI(r1c) + ' · ≈' + fmtBytes(r1b) + ' ' + tr('近 1h') + '</span>' : '';
+              var itemsHtml = (byType[t] || []).map(function (i) {
+                var d = new Date(N(i[1]));
+                var sn = String(i[3] || '').replace(/\s+/g, ' ');
+                var bodyRaw = String(i[4] == null ? '' : i[4]);
+                var oneLine = (sn + (bodyRaw ? ' ' + bodyRaw.replace(/\s+/g, ' ') : '')).slice(0, 140);
+                var fullHtml;
+                if (t === 'tool') {
+                  // 工具条目：参数 JSON → key/value 表；完整解析失败（800 字符截断）用容错逐 key 配对，再失败回退等宽原文
+                  var pairs = null;
+                  try {
+                    var o = JSON.parse(bodyRaw);
+                    if (o && typeof o === 'object' && !Array.isArray(o)) {
+                      pairs = Object.keys(o).map(function (k) {
+                        var v = o[k];
+                        return [k, typeof v === 'string' ? v : JSON.stringify(v)];
+                      });
+                    }
+                  } catch (e2) {}
+                  if (!pairs) {
+                    try {
+                      var body2 = bodyRaw.replace(/^\s*\{/, '');
+                      var re = /"((?:[^"\\]|\\.)*)"\s*:\s*/g, m, keys = [], last = 0;
+                      while ((m = re.exec(body2))) {
+                        var before = body2.slice(Math.max(0, m.index - 1), m.index);
+                        if (before !== '' && before !== ',' && before !== '{') continue;
+                        keys.push({ k: m[1], vs: m.index + m[0].length, at: m.index });
+                      }
+                      var ps = [];
+                      for (var ik = 0; ik < keys.length; ik++) {
+                        var end = ik + 1 < keys.length ? keys[ik + 1].at : body2.length;
+                        var v = body2.slice(keys[ik].vs, end).replace(/,\s*$/, '').trim();
+                        if (v.charAt(0) === '"' && v.charAt(v.length - 1) === '"' && v.length > 1) v = v.slice(1, -1);
+                        if (v.length > 1200) v = v.slice(0, 1200) + ' …';
+                        else if (ik === keys.length - 1 && !/[}"0-9\]]$/.test(v)) v += ' …';
+                        ps.push([keys[ik].k, v]);
+                      }
+                      if (ps.length) pairs = ps;
+                    } catch (e3) {}
+                  }
+                  var kv = pairs ? pairs.map(function (pr) {
+                    var vs = String(pr[1]).replace(/\\n/g, '\n');
+                    if (vs.length > 1200) vs = vs.slice(0, 1200) + ' …';
+                    return '<div class="ud-kvrow"><span class="k">' + esc(pr[0]) + '</span><span class="v">' + esc(vs) + '</span></div>';
+                  }).join('') : '';
+                  fullHtml = kv ? '<div class="ud-toolhead">' + esc(sn) + '</div><div class="ud-tooljson">' + kv + '</div>'
+                    : '<div class="ud-toolhead">' + esc(sn) + '</div><pre class="ud-rawbody">' + esc(bodyRaw) + '</pre>';
+                } else if (t === 'text' || t === 'reasoning') {
+                  fullHtml = '<div class="ud-msgbody' + (t === 'reasoning' ? ' ud-reasoning' : '') + '">' + esc(String(i[4] == null ? '' : i[4])) + '</div>';
+                } else {
+                  fullHtml = esc(oneLine);
+                }
+                return '<div class="ud-brow-item"><span class="ts">' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + '</span><span class="sn" title="' + tr('点击展开/收起全文') + '">' + esc(oneLine) + '<span class="full">' + fullHtml + '</span></span><span class="abs">' + fmtBytes(N(i[2])) + '</span></div>';
+              }).join('') || '';
+              var shown = (byType[t] || []).length;
+              var capNote = N(g[1]) > shown && shown > 0
+                ? '<div class="ud-brow-item"><span class="ts"></span><span class="sn text-muted">' + tr('仅展示最大的前 30 条') + '</span><span class="abs"></span></div>'
+                : '';
+              rowsHtml += '<div class="ud-brow-row" data-bg="' + esc(t) + '"><span class="ud-brow-arrow">▸</span><span class="ud-dot" style="background:' + cat[1] + '"></span><span class="nm">' + esc(cat[0]) + '</span>' +
+                '<span class="text-muted text-small tabular-nums" style="flex:none">' + fmtI(N(g[1])) + tr(' 条') + '</span>' +
+                incBadge +
+                '<span class="bar"><i style="width:' + pct + '%;background:' + cat[1] + '"></i></span>' +
+                '<span class="abs">≈' + fmtBytes(N(g[2])) + '</span><span class="n">' + pct + '%</span></div>' +
+                '<div class="ud-brow-items" data-bgp="' + esc(t) + '" hidden>' + itemsHtml + capNote + '</div>';
+            });
+            br = '<div class="ud-kv-l" style="margin-top:14px">' + tr('上下文浏览器') + '</div><div style="margin-top:2px">' + rowsHtml + '</div>';
+          })();
+          out.innerHTML = gantt + br +
+            '<div class="ud-grid3" style="margin-top:' + (fleet.length ? '14px' : '8px') + '">' +
+            '<div><div class="ud-kv-l">' + tr('工具字节 Top（存储字节）') + '</div>' + rows2(j.tools, tt, function (n) { return n.replace(/^mcp__/, ''); }) + '</div>' +
+            '<div style="grid-column:span 2">' + (tf > 0 ? '<div class="ud-kv-l">' + tr('文件字节 Top（Read/Edit/Write）') + '</div>' + rows2(j.files, tf, base) : '') + '</div>' +
+            '</div>';
+        };
+        var fail = function () { btn.disabled = false; btn.textContent = tr('上下文 Top →'); };
+        if (window.__USAGE_SERVE__) {
+          fetch('/api/ctx?session=' + encodeURIComponent(sid)).then(function (r) { return r.json(); }).then(draw).catch(fail);
+        } else {
+          try {
+            Promise.resolve(window.zcode.callTool('usage_ctx_top', { session: sid })).then(function (r) { draw((r && r.structuredContent) || {}); }).catch(fail);
+          } catch (e2) { fail(); }
+        }
+      });
+      // 浏览器类别行展开/收起
+      bodyEl.addEventListener('click', function (e) {
+        var row = e.target.closest ? e.target.closest('.ud-brow-row') : null;
+        if (row) {
+          var g = row.getAttribute('data-bg');
+          var items = row.parentElement.querySelector('.ud-brow-items[data-bgp="' + (window.CSS && CSS.escape ? CSS.escape(g) : g) + '"]');
+          if (!items) return;
+          var open = items.hidden;
+          items.hidden = !open;
+          row.classList.toggle('ud-open', open);
+          return;
+        }
+        // 条目点击：展开/收起全文（摘要默认单行截断）
+        var it = e.target.closest ? e.target.closest('.ud-brow-item') : null;
+        if (it) it.classList.toggle('ud-full');
+      });
+      // 水位曲线 水位/增量 切换（两个 svg 都在 DOM，切显隐）
+      bodyEl.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('.ud-toggle[data-cmode]') : null;
+        if (!btn) return;
+        var exp = btn.closest('tr.ud-exp');
+        if (!exp) return;
+        var mode = btn.getAttribute('data-cmode');
+        var lv = exp.querySelector('#ud-curve-level'), dl = exp.querySelector('#ud-curve-delta');
+        if (!lv || !dl) return;
+        lv.hidden = mode !== 'level';
+        dl.hidden = mode !== 'delta';
+        Array.prototype.forEach.call(exp.querySelectorAll('.ud-toggle[data-cmode]'), function (b) {
+          b.setAttribute('aria-pressed', b.getAttribute('data-cmode') === mode ? 'true' : 'false');
+        });
+      });
+      // Fleet 泳道条点击：跳到该子会话的请求日志（子会话 id 在 sessionIds 索引表内才可跳）
+      bodyEl.addEventListener('click', function (e) {
+        var bar = e.target.closest ? e.target.closest('.ud-fleet-bar') : null;
+        if (!bar) return;
+        var fsid = bar.getAttribute('data-sid');
+        var idx = (D.sessionIds || []).indexOf(fsid);
+        if (!fsid || idx < 0) return;
+        st.s = idx; page = 1; sessExp = -1; detExp = -1;
         var dbtn = document.querySelector('.nav-pills [role=tab][aria-controls="ud-detail"]');
         if (dbtn) dbtn.click();
         apply();
@@ -2411,6 +2898,12 @@ function __usageBoot(D) {
   function renderMgr() {
     var body = $('ud-mgr-body');
     var p = mgrState.prices, b = mgrState.budget || {}, sw = mgrState.switches || {};
+    // 语言回显：文件权威值（D.userLang）优先，localStorage 是本 origin 的旧显式选择
+    var langPref = (function () {
+      var ul = ''; try { ul = String(window.__USAGE_LANG__ || (typeof DATA === 'object' && DATA && DATA.userLang) || ''); } catch (e) {}
+      if (ul === 'zh' || ul === 'en') return ul;
+      try { return localStorage.getItem('ud-lang') || ''; } catch (e) { return ''; }
+    })();
     var models = Object.keys(p.models || {});
     var used = {};
     frows(false).forEach(function (r) { used[String(MD[r[2]] || '').toLowerCase()] = 1; });
@@ -2438,7 +2931,7 @@ function __usageBoot(D) {
       '<button type="button" class="btn" id="ud-mgr-bsave" style="margin:0;padding:2px 10px;font-size:12px">' + tr('保存预算') + '</button>' +
       '</div>' +
       '<div class="ud-mgr-h">' + tr('通知（macOS 系统通知，全部本地计算、零模型开销）') + '</div>' +
-      '<div class="ud-sw-row"><div><div style="font-size:13px;font-weight:500">界面语言 / Language</div><div class="ud-mgr-sub" style="margin:1px 0 0">' + tr('切换后本地面板立即生效；侧栏面板重新打开后生效') + '</div></div>' +
+      '<div class="ud-sw-row"><div><div style="font-size:13px;font-weight:500">界面语言 / Language</div><div class="ud-mgr-sub" style="margin:1px 0 0">' + tr('语言选择保存到本地文件，全面板共享：本地面板与生成页立即生效；侧栏面板重新打开后生效') + '</div></div>' +
       '<select class="form-select form-select-sm" id="ud-mgr-lang" style="width:auto;flex:none">' +
       '<option value=""' + (langPref === '' ? ' selected' : '') + '>跟随系统 / Auto</option>' +
       '<option value="zh"' + (langPref === 'zh' ? ' selected' : '') + '>中文</option>' +
@@ -2512,17 +3005,25 @@ function __usageBoot(D) {
     $('ud-sw-turnstats').addEventListener('change', function () { postSwitch({ turnstats: this.value }); });
     // 界面语言：localStorage 持久化（'' = 跟随系统）；serve 模式整页 reload 即时生效，
     // 侧栏/file 模式 boot 不可重入，提示重开面板生效
-    var langPref = '';
-    try { langPref = localStorage.getItem('ud-lang') || ''; } catch (e) {}
     $('ud-mgr-lang').addEventListener('change', function () {
-      var v = this.value;
-      try { localStorage.setItem('ud-lang', v); } catch (e) {}
-      if (window.__USAGE_SERVE__) location.reload();
-      else {
+      var v = this.value; // '' 跟随系统 / zh / en
+      if (window.__USAGE_SERVE__) {
+        // 本地面板：文件与 localStorage 同步写，reload 后判定链拿到一致的新值
+        try { localStorage.setItem('ud-lang', v); } catch (e) {}
+        postJSON('/api/lang', { language: v }).catch(function () {}).then(function () { location.reload(); });
+      } else if (window.zcode && typeof window.zcode.callTool === 'function') {
+        // 侧栏：持久化到文件（跨面板权威，重开面板后 resources/read 重新生成即生效）；
+        // 清本 WebView 的 localStorage 残留，防旧选择压制新文件值
+        try { localStorage.removeItem('ud-lang'); } catch (e) {}
+        settingsCall({ language: v }).catch(function () {});
         var tip = document.createElement('span');
         tip.className = 'ud-tag';
-        tip.textContent = I18N_LANG === 'en' ? 'Reopen the panel to apply' : tr('重新打开面板后生效');
+        tip.textContent = tr('已保存，重新打开面板后生效');
         this.replaceWith(tip);
+      } else {
+        // 生成页（file://）：localStorage 同源持久，直接刷新生效
+        try { localStorage.setItem('ud-lang', v); } catch (e) {}
+        location.reload();
       }
     });
     // 厂商配额 Key：只提交有输入的项；已配置项保持输入框为空即不变更
@@ -2709,7 +3210,7 @@ function __usageBoot(D) {
           if (it.pct != null) {
             var pct = Math.max(0, Math.min(100, Math.round(it.pct)));
             html += '<div style="margin:6px 0"><div style="display:flex;justify-content:space-between" class="text-small"><span>' + esc(it.label || tr('配额')) + '</span><span class="tabular-nums text-muted">' + tr('已用 ') + pct + '%' + (it.resets ? ' · ' + esc(String(it.resets)) + tr(' 重置') : '') + '</span></div>' +
-              '<div class="ud-budget-bar' + (pct >= 80 ? ' ud-over' : '') + '"><i style="width:' + pct + '%"></i></div></div>';
+              '<div class="ud-budget-bar' + (pct >= 80 ? ' ud-over' : pct >= 60 ? ' ud-warn' : '') + '"><i style="width:' + pct + '%"></i></div></div>';
           } else if (it.text != null) {
             html += '<div style="display:flex;justify-content:space-between;margin:6px 0" class="text-small"><span>' + esc(it.label || '') + '</span><span class="tabular-nums text-muted">' + esc(String(it.text)) + '</span></div>';
           }

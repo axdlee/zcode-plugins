@@ -38,6 +38,32 @@ function turnExpr() {
   }
   return turnExprCache;
 }
+// agent / context_exceeded 同为较新列：老库回退（agent 置空显示未知来源，ctx 置 NULL 无超限标注）
+let agExprCache = null;
+function agentExpr() {
+  if (agExprCache == null) {
+    try { agExprCache = q1("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='agent'") === '1' ? 'mu.agent' : "''"; }
+    catch (e) { agExprCache = "''"; }
+  }
+  return agExprCache;
+}
+// 子代理会话归属：session.parent_id（较新列）把子会话挂到主会话；老库无此列时留在子会话名下
+let parentExprCache = null;
+function parentExpr() {
+  if (parentExprCache == null) {
+    try { parentExprCache = q1("SELECT count(*) FROM pragma_table_info('session') WHERE name='parent_id'") === '1' ? 'ch.parent_id' : 'NULL'; }
+    catch (e) { parentExprCache = 'NULL'; }
+  }
+  return parentExprCache;
+}
+let ctxExcCache = null;
+function ctxExcExpr() {
+  if (ctxExcCache == null) {
+    try { ctxExcCache = q1("SELECT count(*) FROM pragma_table_info('model_usage') WHERE name='context_exceeded'") === '1' ? 'R.context_exceeded' : 'NULL'; }
+    catch (e) { ctxExcCache = 'NULL'; }
+  }
+  return ctxExcCache;
+}
 
 function priceText() {
   const p = USER_PRICE;
@@ -58,12 +84,15 @@ function metaSQL(limit, disk, extraJson) {
     'providers',(SELECT json_group_array(v) FROM (SELECT v,i FROM P ORDER BY i)),
     'models',(SELECT json_group_array(v) FROM (SELECT v,i FROM M ORDER BY i)),
     'sessions',(SELECT json_group_array(coalesce(se.title,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
+    'sessionIds',(SELECT json_group_array(v) FROM (SELECT v,i FROM S ORDER BY i)),
     'sessionDirs',(SELECT json_group_array(coalesce(se.directory,'')) FROM (SELECT v,i FROM S ORDER BY i) SI LEFT JOIN session se ON se.id=SI.v),
     'tools',(SELECT COALESCE(json_group_array(json_array(tool_name, c, f, d)),'[]') FROM (SELECT tool_name, count(*) AS c, sum(status<>'completed') AS f, CAST(round(avg(duration_ms)) AS int) AS d FROM tool_usage GROUP BY tool_name ORDER BY c DESC LIMIT 8)),
     'todos',(SELECT json_array(sum(CASE WHEN status='completed' THEN 1 ELSE 0 END), count(*)) FROM todo),
     'stability',(SELECT json_array(COALESCE(sum(retry_count),0), COALESCE(sum(cancelled_by_user),0), COALESCE(sum(CASE WHEN status='error' THEN 1 ELSE 0 END),0)) FROM model_usage),
     'hours',(SELECT COALESCE(json_group_object(hr, c),'{}') FROM (SELECT strftime('%H', started_at/1000,'unixepoch','localtime') AS hr, count(*) AS c FROM model_usage GROUP BY hr)),
-    'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+    'compactions',(SELECT COALESCE(json_group_array(json_array(SI.i, c.cnt, c.maxpre, json(c.ts), json(c.triggers))),'[]') FROM (SELECT p.session_id AS sid, count(*) AS cnt, max(COALESCE(json_extract(p.data,'$.preCompactTokenCount'),0)) AS maxpre, json_group_array(strftime('%m-%d %H:%M', p.time_created/1000,'unixepoch','localtime')) AS ts, json_group_array(COALESCE(json_extract(p.data,'$.trigger'),'manual') || '/' || COALESCE(json_extract(p.data,'$.phase'),'')) AS triggers FROM part p WHERE json_extract(p.data,'$.type')='compaction' GROUP BY p.session_id) c LEFT JOIN S SI ON SI.v = c.sid WHERE SI.i IS NOT NULL),
+        'ctxMix',(SELECT COALESCE(json_group_array(json_array(SI.i, m.t, m.b)),'[]') FROM (SELECT p.session_id AS sid, json_extract(p.data,'$.type') AS t, sum(length(p.data)) AS b FROM part p WHERE p.session_id IN (SELECT DISTINCT session_id FROM R) AND p.session_id IS NOT NULL GROUP BY p.session_id, json_extract(p.data,'$.type')) m LEFT JOIN S SI ON SI.v = m.sid WHERE SI.i IS NOT NULL),
+        'sessionAgents',(SELECT COALESCE(json_group_array(json_array(SI.i, a.agent, a.c, a.tok)),'[]') FROM (SELECT COALESCE(${parentExpr()}, mu.session_id) AS root_sid, COALESCE(NULLIF(${agentExpr()},''),'-') AS agent, count(*) AS c, sum(mu.input_tokens+mu.output_tokens+mu.reasoning_tokens) AS tok FROM R mu LEFT JOIN session ch ON ch.id = mu.session_id WHERE mu.query_source='subagent' GROUP BY 1, 2) a LEFT JOIN S SI ON SI.v = a.root_sid WHERE SI.i IS NOT NULL),
     'sessionTools',(SELECT COALESCE(json_group_array(json_array(SI.i, t.tool, t.c, t.ms)),'[]') FROM (SELECT session_id AS sid, tool_name AS tool, count(*) AS c, CAST(sum(duration_ms) AS int) AS ms FROM tool_usage GROUP BY session_id, tool_name) t LEFT JOIN S SI ON SI.v = t.sid WHERE SI.i IS NOT NULL),
     'disk', json('${JSON.stringify(disk).replace(/'/g, "''")}'),
     'providerNames', json_extract(json('${extraJson.replace(/'/g, "''")}'),'$."providerNames"'),
@@ -89,7 +118,7 @@ function metaSQL(limit, disk, extraJson) {
               R.duration_ms,
               CASE R.status WHEN 'completed' THEN 0 WHEN 'error' THEN 1 WHEN 'cancelled' THEN 2 ELSE 3 END,
               CASE R.query_source WHEN 'main_turn' THEN 0 WHEN 'subagent' THEN 1 ELSE 2 END,
-              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turnExpr()}))
+              R.cache_creation_input_tokens, R.time_to_first_token_ms, R.id, R.retry_count, ${turnExpr()}, ${ctxExcExpr()}))
             FROM R
             LEFT JOIN S SI ON SI.v = R.session_id
             LEFT JOIN M MI ON MI.v = R.model_id
@@ -105,7 +134,7 @@ function dataJSON(limit) {
   const disk = { logs: duMB(path.join(os.homedir(), '.zcode/v2/logs')), rollout: duMB(path.join(os.homedir(), '.zcode/cli/rollout')), artifacts: duMB(path.join(os.homedir(), '.zcode/cli/artifacts')), db: duMB(DB) };
   // 全新环境表还不存在（ZCode 尚未写入）：直接空数据，避免 META SQL 报 no such table
   if (q1("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('model_usage','session')") !== '2') {
-    return { providers: [], models: [], sessions: [], sessionDirs: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk, providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, prices: {}, total: 0, covered: 0, rows: [] };
+    return { providers: [], models: [], sessions: [], sessionDirs: [], sessionIds: [], tools: [], todos: [0, 0], stability: [0, 0, 0], hours: {}, compactions: [], sessionTools: [], disk, providerNames: {}, projectMap: {}, budgetDaily: 0, budgetMonthly: 0, ctxMix: [], sessionAgents: [], prices: {}, total: 0, covered: 0, rows: [] };
   }
   let dirsList = [];
   try { dirsList = JSON.parse(q1(`SELECT COALESCE(json_group_array(d),'[]') FROM (SELECT DISTINCT se.directory AS d FROM model_usage u LEFT JOIN session se ON se.id=u.session_id WHERE coalesce(se.directory,'')<>'')`) || '[]'); } catch (e) {}
@@ -337,7 +366,7 @@ function buildDetail(args) {
 }
 
 // ---------- 最小 MCP stdio 协议 ----------
-const SERVER_INFO = { name: 'usage-detail-panel', version: '0.23.4' };
+const SERVER_INFO = { name: 'usage-detail-panel', 'version': '0.30.3' };
 // 完整版仪表盘作为侧栏页面（与 /usage-ui、serve 本地面板同源同界面，单一维护点）：
 // 调 usage.sh dashboard 生成自包含片段（默认全量历史），包上独立壳（主题变量+页签行为）。
 import { execFile } from 'node:child_process';
@@ -450,6 +479,58 @@ const PRICES_FILE = process.env.ZCODE_USAGE_PRICES || path.join(os.homedir(), '.
 const BUDGET_FILE = path.join(os.homedir(), '.zcode', 'usage-budget.json');
 const TURNSTATS_FILE = path.join(os.homedir(), '.zcode', 'usage-turnstats.json');
 const ALERTS_CFG = path.join(os.homedir(), '.zcode', 'usage-alerts.json');
+// 界面语言持久层（usage-lang.json）：跨面板权威的显式选择，''=跟随系统；
+// 侧栏 WebView 的 localStorage 不随面板重开保留，显式语言必须落文件才能保持
+const LANG_FILE = path.join(os.homedir(), '.zcode', 'usage-lang.json');
+function readLangCfg() {
+  try {
+    const v = String(JSON.parse(stripBom(fs.readFileSync(LANG_FILE, 'utf8'))).language || '');
+    return v === 'zh' || v === 'en' ? v : '';
+  } catch (e) { return ''; }
+}
+function writeLangCfg(v) {
+  atomicWrite(LANG_FILE, JSON.stringify({ language: v === 'zh' || v === 'en' ? v : '' }) + '\n');
+}
+// 上下文 Top 下钻（与 serve.mjs 同款 SQL）：工具字节 Top + 文件字节 Top，按会话按需查询
+const CTX_TOP_SQL = `WITH P AS (SELECT data, time_created AS tc, length(data) AS b, json_extract(data,'$.type') AS t FROM part WHERE session_id = ?)
+  SELECT
+    (SELECT COALESCE(json_group_array(json_array(t.tool, t.c, t.b)),'[]') FROM (
+       SELECT json_extract(data,'$.tool') AS tool, count(*) AS c, sum(length(data)) AS b
+       FROM P WHERE json_extract(data,'$.type')='tool' GROUP BY 1 ORDER BY b DESC LIMIT 8) t) AS tools,
+    (SELECT COALESCE(json_group_array(json_array(f.path, f.c, f.b)),'[]') FROM (
+       SELECT json_extract(data,'$.state.input.file_path') AS path, count(*) AS c, sum(length(data)) AS b
+       FROM P WHERE json_extract(data,'$.type')='tool'
+         AND json_extract(data,'$.tool') IN ('Read','Edit','Write')
+         AND json_extract(data,'$.state.input.file_path') IS NOT NULL
+       GROUP BY 1 ORDER BY b DESC LIMIT 8) f) AS files,
+    (SELECT COALESCE(json_group_array(json_array(g.agent, g.started_at, g.duration_ms, g.tok, g.sid)),'[]') FROM (
+       SELECT COALESCE(NULLIF(${agentExpr()},''),'-') AS agent, mu.started_at AS started_at, mu.duration_ms AS duration_ms,
+              mu.input_tokens+mu.output_tokens+mu.reasoning_tokens AS tok, mu.session_id AS sid
+       FROM model_usage mu LEFT JOIN session ch ON ch.id = mu.session_id
+       WHERE COALESCE(${parentExpr()}, mu.session_id) = ? AND mu.query_source = 'subagent'
+       ORDER BY mu.started_at LIMIT 500) g) AS fleet,
+    (SELECT COALESCE(json_group_array(json_array(g.t, g.c, g.b, g.r1c, g.r1b)),'[]') FROM (
+       SELECT t, count(*) AS c, sum(b) AS b,
+              sum(CASE WHEN tc >= (strftime('%s','now') * 1000 - 3600000) THEN 1 ELSE 0 END) AS r1c,
+              sum(CASE WHEN tc >= (strftime('%s','now') * 1000 - 3600000) THEN b ELSE 0 END) AS r1b
+       FROM P WHERE t NOT IN ('step-start','step-finish','timeline') GROUP BY t ORDER BY b DESC) g) AS bgroups,
+    (SELECT COALESCE(json_group_array(json_array(i.t, i.tc, i.b, i.sn, i.sbody)),'[]') FROM (
+       SELECT t, tc, b, sn, sbody FROM (
+         SELECT t, tc, b,
+           CASE t WHEN 'tool' THEN json_extract(data,'$.tool') WHEN 'text' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 600) WHEN 'reasoning' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 600) WHEN 'file' THEN COALESCE(json_extract(data,'$.url'), '') WHEN 'compaction' THEN COALESCE(json_extract(data,'$.trigger'), '') || '/' || COALESCE(json_extract(data,'$.phase'), '') ELSE '' END AS sn,
+           CASE t WHEN 'tool' THEN substr(COALESCE(json_extract(data,'$.state.input'), json_extract(data,'$.state.output'), ''), 1, 800) WHEN 'text' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 800) WHEN 'reasoning' THEN substr(COALESCE(json_extract(data,'$.text'), ''), 1, 800) ELSE '' END AS sbody,
+           row_number() OVER (PARTITION BY t ORDER BY b DESC) AS rn
+         FROM P WHERE t NOT IN ('step-start','step-finish','timeline')
+       ) WHERE rn <= 30 ORDER BY b DESC LIMIT 150) i) AS bitems`;
+function ctxTop(sid) {
+  sid = String(sid || '').slice(0, 128);
+  if (!sid) return { tools: [], files: [], fleet: [], bgroups: [], bitems: [] };
+  try {
+    const row = db.prepare(CTX_TOP_SQL).get(sid, sid);
+    const j = (v) => { try { return JSON.parse(v) || []; } catch (e) { return []; } };
+    return { tools: j(row && row.tools), files: j(row && row.files), fleet: j(row && row.fleet), bgroups: j(row && row.bgroups), bitems: j(row && row.bitems) };
+  } catch (e) { return { tools: [], files: [], fleet: [], bgroups: [], bitems: [] }; } // 老库无 part 表
+}
 
 function atomicWrite(file, data, mode) {
   // 原子写 + Windows 兜底：rename 到被占用（杀毒/并发读）的目标会 EPERM——短重试后直写保功能
@@ -616,6 +697,16 @@ const TOOLS = [
     _meta: { ui: { visibility: ['app'] } },
   },
   {
+    name: 'usage_ctx_top',
+    description: "会话上下文 Top 下钻（App-only，不经模型）：该会话 part 分段里工具调用字节 Top 与 Read/Edit/Write 文件字节 Top，口径为存储字节近似。与面板「上下文构成」环配套。",
+    inputSchema: {
+      type: 'object',
+      properties: { session: { type: 'string', description: '会话 id' } },
+      additionalProperties: false,
+    },
+    _meta: { ui: { resourceUri: 'ui://usage-detail/panel.html', surface: 'usage', visibility: ['app'] } },
+  },
+  {
     name: 'usage_settings_set',
     description: '写入本地配置（App-only，不经模型）：price 更新单模型价（可带 ctxOverride 覆盖上下文窗口）、priceGeneral 币种/汇率/自动同步、budget 日月预算、switches 通知开关、priceRemove 删除模型价、vendorKeys 多厂商配额 Key（写入本地凭据文件，不回传明文）。',
     inputSchema: {
@@ -626,6 +717,7 @@ const TOOLS = [
         priceRemove: { type: 'string', description: '要删除的模型名' },
         budget: { type: 'object', description: '{daily,monthly}' },
         switches: { type: 'object', description: '{turnstats:off|notify|inject, budgetAlerts:bool, permissionAlerts:bool}' },
+        language: { type: 'string', description: "界面语言覆盖：'' 跟随系统 / 'zh' / 'en'；写入 usage-lang.json 并失效面板缓存" },
         vendorKeys: { type: 'object', description: '{deepseek?,kimi?,openrouter?,minimax?}：API Key，空串清除' },
       },
       additionalProperties: false,
@@ -762,8 +854,14 @@ function handleToolCall(name, args) {
   }
   if (name === 'usage_settings_get') {
     return {
-      structuredContent: { prices: slimPrices(args && args.query), budget: readBudgetCfg(), switches: readSwitchesCfg(), vendors: readVendorMask() },
+      structuredContent: { prices: slimPrices(args && args.query), budget: readBudgetCfg(), switches: readSwitchesCfg(), vendors: readVendorMask(), language: readLangCfg() },
       content: [{ type: 'text', text: '配置已读取' }],
+    };
+  }
+  if (name === 'usage_ctx_top') {
+    return {
+      structuredContent: ctxTop(args && args.session),
+      content: [{ type: 'text', text: '上下文 Top 已返回' }],
     };
   }
   if (name === 'usage_settings_set') {
@@ -802,6 +900,11 @@ function handleToolCall(name, args) {
     if (args && args.budget) writeBudgetCfg(args.budget);
     if (args && args.switches) saved.switches = writeSwitchesCfg(args.switches);
     if (args && args.vendorKeys) saved.vendors = writeVendorKeys(args.vendorKeys);
+    if (args && args.language !== undefined) {
+      writeLangCfg(args.language);
+      saved.language = readLangCfg();
+      dashCache = { at: 0, html: null }; // 面板 HTML 缓存失效：重开面板立即按新语言重生成
+    }
     // 附带保存后的瘦身价格表：面板保存成功直接软刷新（MCP App 沙箱内禁止 location.reload）
     if (args && (args.price || args.priceRemove || args.priceGeneral || args.vendorKeys)) saved.prices = slimPrices('');
     return {
