@@ -1920,7 +1920,7 @@
     "matchedBy": "official-repository-asset",
     "homepage": "https://www.tripo3d.ai",
     "mimeType": "image/png",
-    "sha256": "60f06a7443bb74f962c3095e6c63bb68b76c4d345c3e7cf2e22831720e080d1f",
+    "sha256": "a85e05cad881498c048a4ce6bcef99b6eb3bcb89172d446a577207102f55057b",
     "transformation": "Solid background, 512x512 PNG; no baked corner radius"
   },
   {
@@ -2508,5 +2508,22 @@
     "sha256": "f3f4002481f4b84175634de34730af02bde2cf125fab10add753425fc8dc0727",
     "mimeType": "image/png",
     "transformation": "Solid background, 512x512 PNG; no baked corner radius"
+  },
+  {
+    "name": "zcode-site",
+    "icon": "zcode-site/icon.png",
+    "source": "ZCode authored asset",
+    "sha256": "9d7f32e5bf2e0bf1f1b1967268534090c611fd308659a0360c1c729b35553d7d",
+    "mimeType": "image/png",
+    "transformation": "Solid background, 512x512 PNG; no baked corner radius"
+  },
+  {
+    "name": "anet",
+    "icon": "anet/icon.png",
+    "source": "https://avatars.githubusercontent.com/u/305781773?s=256&v=4",
+    "matchedBy": "official-github-organization-avatar",
+    "homepage": "https://agentnetwork.org.cn",
+    "mimeType": "image/png",
+    "sha256": "2ff11555dd0be1f5efeac9005014770d2898f220d20367da32ba4434566d2a68"
   }
 ]
